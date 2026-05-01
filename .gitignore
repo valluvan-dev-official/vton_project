@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Storage (runtime data — not committed)
+storage/inputs/
+storage/outputs/
+storage/training_pairs/
+
+# ML artefacts
+ml/checkpoints/
+ml/data/raw/
+ml/data/processed/
+*.pt
+*.pth
+*.safetensors
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+data:
+  training_pairs_path: "../storage/training_pairs"
+  image_size: 512
+  val_split: 0.1
+  min_ssim: 0.0
+
+training:
+  epochs: 50
+  batch_size: 4
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  lambda_l1: 1.0
+  lambda_perc: 0.1
+  lambda_warp: 0.01
+
+checkpoint_dir: "ml/checkpoints"
+resume_checkpoint: null

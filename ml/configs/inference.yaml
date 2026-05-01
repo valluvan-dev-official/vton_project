@@ -1,0 +1,13 @@
+model:
+  checkpoint_path: "ml/checkpoints/best.pt"
+  device: "cuda"           # "cpu" for CPU-only inference
+
+inference:
+  image_size: 512
+  batch_size: 1
+  output_dir: "../storage/outputs"
+
+postprocess:
+  sharpen: true
+  sharpen_percent: 120
+  blend_with_original: true

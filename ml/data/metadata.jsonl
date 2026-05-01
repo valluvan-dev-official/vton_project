@@ -1,0 +1,4 @@
+# Each line is a JSON object describing one training sample.
+# Fields: job_id, person_path, garment_path, result_path, ssim_score, saved_at
+# Example:
+# {"job_id":"abc123","person":"training_pairs/abc123/person.jpg","garment":"training_pairs/abc123/garment.jpg","result":"training_pairs/abc123/result.jpg","ssim_score":0.72,"saved_at":"2026-05-01T00:00:00"}

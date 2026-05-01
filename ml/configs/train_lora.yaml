@@ -1,0 +1,23 @@
+data:
+  training_pairs_path: "../storage/training_pairs"
+  image_size: 512
+  val_split: 0.1
+  min_ssim: 0.65
+
+training:
+  epochs: 20
+  batch_size: 2
+  lr: 5.0e-5
+  weight_decay: 1.0e-4
+  lambda_l1: 1.0
+  lambda_perc: 0.05
+  lambda_warp: 0.005
+
+  # LoRA-specific settings (applied to GarmentEncoder & UNet attention layers)
+  lora_rank: 8
+  lora_alpha: 16
+  lora_target_modules: ["query", "key", "value"]
+  freeze_base_model: true
+
+checkpoint_dir: "ml/checkpoints/lora"
+resume_checkpoint: null
