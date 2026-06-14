@@ -1,0 +1,18 @@
+{
+  "id": "aisubscrip2/dci-vton-inference",
+  "title": "DCI-VTON Inference",
+  "code_file": "dci_vton_inference.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "accelerator": "nvidiaTeslaT4",
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_internet": true,
+  "dataset_sources": [
+    "aisubscrip2/dci-vton-weights",
+    "aisubscrip2/vton-job-input"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

@@ -63,7 +63,7 @@ class LocalStorageBackend(StorageBackend):
             p.unlink()
 
     def url(self, key: str) -> str:
-        return str(self._full(key))
+        return self._full(key).as_posix()
 
 
 class S3StorageBackend(StorageBackend):

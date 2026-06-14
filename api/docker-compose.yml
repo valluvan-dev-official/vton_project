@@ -1,27 +1,53 @@
-version: "3.9"
-
 services:
   api:
     build: .
     ports:
       - "8000:8000"
     env_file: ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://vton:vton@postgres:5432/vton
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      LOCAL_STORAGE_PATH: /app/storage
     volumes:
       - ../storage:/app/storage
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   worker:
     build: .
     env_file: ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://vton:vton@postgres:5432/vton
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      LOCAL_STORAGE_PATH: /app/storage
     volumes:
       - ../storage:/app/storage
+      - ../ml:/app/ml
+      - $USERPROFILE/.kaggle:/root/.kaggle
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: celery -A app.workers.tasks.celery_app worker --loglevel=info --concurrency=2
+
+  flower:
+    build: .
+    ports:
+      - "5555:5555"
+    env_file: ../.env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    depends_on:
+      - redis
+    command: celery -A app.workers.tasks.celery_app flower --port=5555
 
   postgres:
     image: postgres:16-alpine
@@ -30,14 +56,29 @@ services:
       POSTGRES_PASSWORD: vton
       POSTGRES_DB: vton
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vton"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pg_data:
+
+networks:
+  default:
+    name: vton_net
+    external: true

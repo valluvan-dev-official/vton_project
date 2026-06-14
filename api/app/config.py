@@ -1,5 +1,9 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pathlib import Path
+
+# Resolve .env relative to this file so it works regardless of CWD
+_ENV_FILE = Path(__file__).parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -32,8 +36,14 @@ class Settings(BaseSettings):
     # API limits
     MAX_UPLOAD_SIZE_MB: int = 10
 
+    # Kaggle DCI-VTON
+    KAGGLE_USERNAME: str = ""
+    KAGGLE_KEY: str = ""
+    KAGGLE_NOTEBOOK_SLUG: str = ""
+    KAGGLE_DATASET_SLUG: str = ""
+
     class Config:
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
         extra = "ignore"
 
 

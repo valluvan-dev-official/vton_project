@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Virtual Try-On</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f0f0f;
+      color: #e8e8e8;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    header {
+      width: 100%;
+      padding: 20px 32px;
+      border-bottom: 1px solid #222;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    header h1 { font-size: 1.3rem; font-weight: 600; letter-spacing: -0.3px; }
+    header span { font-size: 0.75rem; color: #666; background: #1a1a1a;
+                  padding: 3px 8px; border-radius: 20px; border: 1px solid #333; }
+
+    main {
+      width: 100%;
+      max-width: 960px;
+      padding: 40px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 32px;
+    }
+
+    /* Upload section */
+    .upload-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }
+
+    .upload-card {
+      background: #161616;
+      border: 1.5px dashed #333;
+      border-radius: 16px;
+      padding: 28px 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      position: relative;
+    }
+    .upload-card:hover { border-color: #555; background: #1c1c1c; }
+    .upload-card.has-image { border-style: solid; border-color: #3a8a5c; }
+
+    .upload-card input[type=file] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+
+    .upload-icon { font-size: 2.2rem; }
+    .upload-label { font-size: 0.9rem; font-weight: 600; }
+    .upload-hint { font-size: 0.75rem; color: #666; }
+
+    .preview-img {
+      width: 100%;
+      max-height: 280px;
+      object-fit: contain;
+      border-radius: 10px;
+      display: none;
+    }
+    .upload-card.has-image .preview-img { display: block; }
+    .upload-card.has-image .upload-icon,
+    .upload-card.has-image .upload-hint { display: none; }
+
+    /* Submit button */
+    .btn-tryon {
+      width: 100%;
+      padding: 16px;
+      background: linear-gradient(135deg, #2d6a4f, #3a8a5c);
+      border: none;
+      border-radius: 12px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+    }
+    .btn-tryon:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); }
+    .btn-tryon:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+    /* Status bar */
+    .status-bar {
+      display: none;
+      background: #161616;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 20px 24px;
+      gap: 16px;
+      flex-direction: column;
+    }
+    .status-bar.visible { display: flex; }
+
+    .status-top { display: flex; justify-content: space-between; align-items: center; }
+    .status-label { font-size: 0.85rem; font-weight: 600; }
+    .status-badge {
+      font-size: 0.72rem; padding: 4px 10px; border-radius: 20px; font-weight: 600;
+    }
+    .badge-pending   { background: #2a2000; color: #f0a500; border: 1px solid #3d2e00; }
+    .badge-processing{ background: #001a3a; color: #4da6ff; border: 1px solid #003070; }
+    .badge-completed { background: #00200e; color: #3dbb6d; border: 1px solid #004d20; }
+    .badge-failed    { background: #200000; color: #ff5555; border: 1px solid #4d0000; }
+
+    .progress-bar-wrap {
+      background: #222; border-radius: 8px; height: 6px; overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%; background: linear-gradient(90deg, #2d6a4f, #3dbb6d);
+      border-radius: 8px;
+      transition: width 0.6s ease;
+      width: 0%;
+    }
+
+    .status-msg { font-size: 0.8rem; color: #888; }
+    .eta-msg    { font-size: 0.75rem; color: #555; }
+
+    /* Result section */
+    .result-section {
+      display: none;
+      background: #161616;
+      border: 1px solid #2a2a2a;
+      border-radius: 16px;
+      padding: 28px 24px;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .result-section.visible { display: flex; }
+
+    .result-title { font-size: 1rem; font-weight: 700; color: #3dbb6d; }
+
+    .result-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 16px;
+    }
+    .result-item { display: flex; flex-direction: column; gap: 8px; }
+    .result-item span { font-size: 0.72rem; color: #666; text-align: center; }
+    .result-item img {
+      width: 100%; border-radius: 10px; object-fit: cover;
+      aspect-ratio: 3/4; background: #1a1a1a;
+    }
+
+    .btn-download {
+      align-self: flex-start;
+      padding: 10px 20px;
+      background: #1a1a1a;
+      border: 1px solid #3a8a5c;
+      border-radius: 8px;
+      color: #3dbb6d;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
+    .btn-download:hover { background: #0d2a1a; }
+
+    /* Error */
+    .error-box {
+      display: none;
+      background: #1a0000;
+      border: 1px solid #4d0000;
+      border-radius: 10px;
+      padding: 14px 18px;
+      color: #ff5555;
+      font-size: 0.82rem;
+    }
+    .error-box.visible { display: block; }
+
+    @media (max-width: 600px) {
+      .upload-row { grid-template-columns: 1fr; }
+      .result-grid { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Virtual Try-On</h1>
+  <span>DCI-VTON · Kaggle GPU</span>
+</header>
+
+<main>
+
+  <!-- Upload -->
+  <div class="upload-row">
+    <div class="upload-card" id="card-person">
+      <input type="file" id="input-person" accept="image/jpeg,image/png" />
+      <div class="upload-icon">🧍</div>
+      <div class="upload-label">Person Photo</div>
+      <div class="upload-hint">Front-facing · JPG/PNG · max 10MB</div>
+      <img class="preview-img" id="preview-person" alt="person preview" />
+    </div>
+
+    <div class="upload-card" id="card-garment">
+      <input type="file" id="input-garment" accept="image/jpeg,image/png" />
+      <div class="upload-icon">👕</div>
+      <div class="upload-label">Garment Photo</div>
+      <div class="upload-hint">Shirt / Kurta · JPG/PNG · max 10MB</div>
+      <img class="preview-img" id="preview-garment" alt="garment preview" />
+    </div>
+  </div>
+
+  <button class="btn-tryon" id="btn-submit" disabled>Try On →</button>
+
+  <!-- Status -->
+  <div class="status-bar" id="status-bar">
+    <div class="status-top">
+      <span class="status-label" id="status-label">Submitting job...</span>
+      <span class="status-badge badge-pending" id="status-badge">pending</span>
+    </div>
+    <div class="progress-bar-wrap">
+      <div class="progress-bar-fill" id="progress-fill"></div>
+    </div>
+    <div class="status-msg" id="status-msg">Uploading images to Kaggle...</div>
+    <div class="eta-msg" id="eta-msg">Estimated time: ~3 minutes</div>
+  </div>
+
+  <!-- Error -->
+  <div class="error-box" id="error-box"></div>
+
+  <!-- Result -->
+  <div class="result-section" id="result-section">
+    <div class="result-title">✓ Try-On Complete</div>
+    <div class="result-grid">
+      <div class="result-item">
+        <img id="result-person" alt="person" />
+        <span>Original Person</span>
+      </div>
+      <div class="result-item">
+        <img id="result-garment" alt="garment" />
+        <span>Garment</span>
+      </div>
+      <div class="result-item">
+        <img id="result-output" alt="result" />
+        <span>Result</span>
+      </div>
+    </div>
+    <a class="btn-download" id="btn-download" download="tryon_result.jpg">↓ Download Result</a>
+  </div>
+
+</main>
+
+<script>
+  const inputPerson  = document.getElementById('input-person');
+  const inputGarment = document.getElementById('input-garment');
+  const cardPerson   = document.getElementById('card-person');
+  const cardGarment  = document.getElementById('card-garment');
+  const previewP     = document.getElementById('preview-person');
+  const previewG     = document.getElementById('preview-garment');
+  const btnSubmit    = document.getElementById('btn-submit');
+  const statusBar    = document.getElementById('status-bar');
+  const statusLabel  = document.getElementById('status-label');
+  const statusBadge  = document.getElementById('status-badge');
+  const progressFill = document.getElementById('progress-fill');
+  const statusMsg    = document.getElementById('status-msg');
+  const etaMsg       = document.getElementById('eta-msg');
+  const errorBox     = document.getElementById('error-box');
+  const resultSec    = document.getElementById('result-section');
+  const resultOutput = document.getElementById('result-output');
+  const btnDownload  = document.getElementById('btn-download');
+
+  let personFile = null, garmentFile = null;
+  let pollInterval = null;
+
+  function previewFile(file, imgEl, cardEl) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      imgEl.src = e.target.result;
+      cardEl.classList.add('has-image');
+    };
+    reader.readAsDataURL(file);
+  }
+
+  inputPerson.addEventListener('change', e => {
+    personFile = e.target.files[0];
+    if (personFile) previewFile(personFile, previewP, cardPerson);
+    checkReady();
+  });
+
+  inputGarment.addEventListener('change', e => {
+    garmentFile = e.target.files[0];
+    if (garmentFile) previewFile(garmentFile, previewG, cardGarment);
+    checkReady();
+  });
+
+  function checkReady() {
+    btnSubmit.disabled = !(personFile && garmentFile);
+  }
+
+  function setBadge(status) {
+    statusBadge.textContent = status;
+    statusBadge.className = 'status-badge badge-' + status;
+  }
+
+  function setProgress(pct, msg, eta) {
+    progressFill.style.width = pct + '%';
+    if (msg) statusMsg.textContent = msg;
+    if (eta) etaMsg.textContent = eta;
+  }
+
+  function showError(msg) {
+    errorBox.textContent = msg;
+    errorBox.classList.add('visible');
+    statusBar.classList.remove('visible');
+  }
+
+  btnSubmit.addEventListener('click', async () => {
+    errorBox.classList.remove('visible');
+    resultSec.classList.remove('visible');
+    statusBar.classList.add('visible');
+    btnSubmit.disabled = true;
+
+    setBadge('pending');
+    statusLabel.textContent = 'Submitting job...';
+    setProgress(5, 'Uploading images...', 'Estimated time: ~3 minutes');
+
+    const fd = new FormData();
+    fd.append('person_image',  personFile);
+    fd.append('garment_image', garmentFile);
+
+    let jobId;
+    try {
+      const res = await fetch('/api/v1/tryon', { method: 'POST', body: fd });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || 'Submission failed');
+      }
+      const data = await res.json();
+      jobId = data.job_id;
+    } catch (e) {
+      showError('Submission failed: ' + e.message);
+      btnSubmit.disabled = false;
+      return;
+    }
+
+    setBadge('processing');
+    statusLabel.textContent = 'Processing on Kaggle GPU...';
+    setProgress(15, 'Kaggle notebook starting...', 'Estimated time: ~2-3 minutes');
+
+    // Poll every 10 seconds
+    let elapsed = 0;
+    pollInterval = setInterval(async () => {
+      elapsed += 10;
+      try {
+        const res  = await fetch(`/api/v1/status/${jobId}`);
+        const data = await res.json();
+        const st   = data.status;
+
+        if (st === 'processing') {
+          const pct = Math.min(15 + (elapsed / 180) * 75, 88);
+          setBadge('processing');
+          setProgress(pct,
+            elapsed < 30  ? 'SegFormer segmentation running...' :
+            elapsed < 60  ? 'DensePose IUV extraction...' :
+            elapsed < 90  ? 'AFWM garment warping...' :
+            elapsed < 120 ? 'DCI diffusion inference (50 steps)...' :
+                            'Blending final result...',
+            `~${Math.max(0, Math.round((180 - elapsed) / 60))} min remaining`
+          );
+        } else if (st === 'completed') {
+          clearInterval(pollInterval);
+          setBadge('completed');
+          statusLabel.textContent = 'Complete!';
+          setProgress(100, 'Done!', '');
+
+          // Show result
+          resultOutput.src = data.result_url + '?t=' + Date.now();
+          btnDownload.href = data.result_url;
+          document.getElementById('result-person').src  = URL.createObjectURL(personFile);
+          document.getElementById('result-garment').src = URL.createObjectURL(garmentFile);
+          resultSec.classList.add('visible');
+          btnSubmit.disabled = false;
+        } else if (st === 'failed') {
+          clearInterval(pollInterval);
+          showError('Job failed: ' + (data.error_message || 'Unknown error'));
+          btnSubmit.disabled = false;
+        }
+      } catch (e) {
+        // network hiccup — keep polling
+      }
+    }, 10000);
+  });
+</script>
+</body>
+</html>
