@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     USE_OWN_MODEL: bool = False
     MODEL_PATH: str = ""
     DEVICE: str = "cpu"
+    WEIGHTS_DIR: str = ""
 
     # Quality threshold — results with SSIM >= this auto-save as training pairs
     MIN_QUALITY_SCORE: float = 0.65

@@ -113,10 +113,24 @@ class InferenceRouter:
     def __init__(self):
         self.use_own_model: bool = False
         self._model = None
+        self._gpu_engine = None
 
         # Decide mode
         self._mode = "placeholder"
-        if KAGGLE_USERNAME and KAGGLE_KEY and KAGGLE_NOTEBOOK_SLUG:
+        device = os.getenv("DEVICE", "cpu").strip().lower()
+        weights_dir = os.getenv("WEIGHTS_DIR", "").strip()
+
+        if device == "cuda" and weights_dir and Path(weights_dir).exists():
+            self._mode = "local_gpu"
+            logger.info("InferenceRouter: Local GPU mode — loading models...")
+            try:
+                from ml.scripts.gpu_inference import GPUInferenceEngine
+                self._gpu_engine = GPUInferenceEngine(weights_dir=weights_dir, device="cuda")
+                logger.info("InferenceRouter: Local GPU mode active.")
+            except Exception as exc:
+                logger.warning(f"Local GPU init failed: {exc}. Falling back.")
+                self._mode = "placeholder"
+        elif KAGGLE_USERNAME and KAGGLE_KEY and KAGGLE_NOTEBOOK_SLUG:
             self._mode = "kaggle"
             logger.info("InferenceRouter: Kaggle DCI-VTON mode active.")
         else:
@@ -135,6 +149,12 @@ class InferenceRouter:
     def run(self, person_image_path: str, garment_image_path: str, output_path: str) -> str:
         if self.use_own_model and self._model:
             return self._run_own_model(person_image_path, garment_image_path, output_path)
+        if self._mode == "local_gpu" and self._gpu_engine:
+            try:
+                job_id = Path(output_path).stem
+                return self._gpu_engine.run(person_image_path, garment_image_path, output_path, job_id)
+            except Exception as exc:
+                logger.warning(f"Local GPU inference failed: {exc}. Falling back to placeholder.")
         if self._mode == "kaggle":
             try:
                 return self._run_kaggle(person_image_path, garment_image_path, output_path)

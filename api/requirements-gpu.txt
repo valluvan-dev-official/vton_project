@@ -1,0 +1,14 @@
+# GPU inference dependencies
+omegaconf==2.1.1
+einops
+transformers==4.46.3
+albumentations
+ftfy
+regex
+fvcore
+iopath
+open-clip-torch
+kornia
+torchmetrics
+git+https://github.com/openai/CLIP.git
+git+https://github.com/facebookresearch/detectron2.git
