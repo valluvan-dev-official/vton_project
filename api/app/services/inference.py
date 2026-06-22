@@ -277,7 +277,7 @@ class InferenceRouter:
     def _trigger_kaggle_notebook(self, job_id: str, person_path: str, garment_path: str) -> str:
         """Bake images into the notebook as base64 then push to trigger a run."""
         import subprocess, base64, copy
-        notebook_dir = Path(__file__).parents[3] / "ml" / "kaggle"
+        notebook_dir = Path(__file__).parents[2] / "ml" / "kaggle"
         notebook_path = notebook_dir / "dci_vton_inference.ipynb"
         env = _kaggle_env()
 
@@ -353,7 +353,7 @@ class InferenceRouter:
             (tmpdir / "dci_vton_inference.ipynb").write_text(json.dumps(patched_nb, indent=1))
             shutil.copy2(notebook_dir / "kernel-metadata.json", tmpdir / "kernel-metadata.json")
             r = subprocess.run(
-                ["kaggle", "kernels", "push", "-p", str(tmpdir), "--acc", "NvidiaTeslaT4"],
+                ["kaggle", "kernels", "push", "-p", str(tmpdir), "--accelerator", "NvidiaTeslaT4"],
                 capture_output=True, text=True, env=env, timeout=60
             )
         if r.returncode != 0:
@@ -421,7 +421,20 @@ class InferenceRouter:
                         logger.warning(f"[Kaggle] GPU_INCOMPATIBLE (current run): {msg}")
                         raise RuntimeError(f"GPU_INCOMPATIBLE: {msg}")
 
-                    # If chk files exist but no result yet → run still in progress
+                    # file_count=500 means Kaggle API limit hit = notebook is DONE.
+                    # Files only appear after notebook completes (0 while running).
+                    # Our result file exists on disk but is beyond the 500-file limit.
+                    # Return here → _download_kaggle_result will use CLI to fetch it.
+                    if len(files) >= 500:
+                        logger.info(f"[Kaggle] File count=500 (API limit) — notebook complete, CLI download will fetch result")
+                        return
+
+                    # chk_10_done.txt = pipeline fully complete (result saved)
+                    if "chk_10_done.txt" in file_names:
+                        logger.info(f"[Kaggle] chk_10_done.txt found — notebook complete")
+                        return
+
+                    # chk files present → run still in progress
                     chk_files = [n for n in file_names if n.startswith("chk_")]
                     if chk_files:
                         logger.info(f"[Kaggle] Run in progress, checkpoints: {sorted(chk_files)}")
@@ -520,27 +533,27 @@ class InferenceRouter:
         except Exception as e:
             logger.warning(f"[Kaggle] REST API download attempt failed: {e}")
 
-        # Strategy 2: kaggle CLI with early kill once result file appears on disk
-        logger.info("[Kaggle] Falling back to CLI download with early-kill strategy...")
+        # Strategy 4: kaggle CLI — download full output, find result by job_id
+        # Used when result file is beyond the 500-file ListKernelSessionOutput limit.
+        logger.info("[Kaggle] Falling back to CLI download (500-file limit bypass)...")
         env = _kaggle_env()
         with tempfile.TemporaryDirectory() as tmpdir:
             proc = subprocess.Popen(
                 ["kaggle", "kernels", "output", run_ref, "-p", tmpdir],
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            deadline = time.time() + 300  # 5 min max
+            deadline = time.time() + 300
             found = None
             while time.time() < deadline:
-                # Check if result file downloaded yet
                 candidates = list(Path(tmpdir).rglob(f"{job_id}.jpg"))
                 if not candidates:
-                    candidates = list(Path(tmpdir).rglob("*.jpg"))
+                    candidates = list(Path(tmpdir).rglob(f"!{job_id}.jpg"))
                 if candidates:
                     found = candidates[0]
                     break
                 if proc.poll() is not None:
-                    # Process finished — check one more time
-                    candidates = list(Path(tmpdir).rglob(f"{job_id}.jpg")) or list(Path(tmpdir).rglob("*.jpg"))
+                    candidates = (list(Path(tmpdir).rglob(f"{job_id}.jpg")) or
+                                  list(Path(tmpdir).rglob(f"!{job_id}.jpg")))
                     if candidates:
                         found = candidates[0]
                     break

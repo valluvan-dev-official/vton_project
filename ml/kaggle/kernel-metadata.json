@@ -7,7 +7,6 @@
   "is_private": true,
   "enable_gpu": true,
   "accelerator": "nvidiaTeslaT4",
-  "machine_shape": "NvidiaTeslaT4",
   "enable_internet": true,
   "dataset_sources": [
     "aisubscrip2/dci-vton-weights",
