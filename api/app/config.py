@@ -37,11 +37,13 @@ class Settings(BaseSettings):
     # API limits
     MAX_UPLOAD_SIZE_MB: int = 10
 
-    # Kaggle DCI-VTON
-    KAGGLE_USERNAME: str = ""
-    KAGGLE_KEY: str = ""
-    KAGGLE_NOTEBOOK_SLUG: str = ""
-    KAGGLE_DATASET_SLUG: str = ""
+    # SageMaker Async Inference (DCI-VTON)
+    SAGEMAKER_ENDPOINT_NAME: str = ""
+    SAGEMAKER_REGION: str = "us-east-1"
+    SAGEMAKER_S3_BUCKET: str = ""
+    SAGEMAKER_ASYNC_INPUT_PREFIX: str = "dci-vton/async-input"
+    SAGEMAKER_POLL_INTERVAL_SECONDS: int = 5
+    SAGEMAKER_POLL_TIMEOUT_SECONDS: int = 900
 
     class Config:
         env_file = str(_ENV_FILE)

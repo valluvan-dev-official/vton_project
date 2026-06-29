@@ -29,7 +29,6 @@ services:
     volumes:
       - ../storage:/app/storage
       - ../ml:/app/ml
-      - $USERPROFILE/.kaggle:/root/.kaggle
     depends_on:
       postgres:
         condition: service_healthy

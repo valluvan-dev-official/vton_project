@@ -195,7 +195,7 @@
 
 <header>
   <h1>Virtual Try-On</h1>
-  <span>DCI-VTON · Kaggle GPU</span>
+  <span>DCI-VTON · SageMaker GPU</span>
 </header>
 
 <main>
@@ -230,7 +230,7 @@
     <div class="progress-bar-wrap">
       <div class="progress-bar-fill" id="progress-fill"></div>
     </div>
-    <div class="status-msg" id="status-msg">Uploading images to Kaggle...</div>
+    <div class="status-msg" id="status-msg">Uploading images...</div>
     <div class="eta-msg" id="eta-msg">Estimated time: ~3 minutes</div>
   </div>
 
@@ -353,8 +353,8 @@
     }
 
     setBadge('processing');
-    statusLabel.textContent = 'Processing on Kaggle GPU...';
-    setProgress(15, 'Kaggle notebook starting...', 'Estimated time: ~2-3 minutes');
+    statusLabel.textContent = 'Processing on SageMaker GPU...';
+    setProgress(15, 'Inference job starting...', 'Estimated time: ~2-3 minutes');
 
     // Poll every 10 seconds
     let elapsed = 0;

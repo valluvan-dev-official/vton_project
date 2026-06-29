@@ -23,8 +23,5 @@ python-multipart==0.0.9
 httpx==0.27.0
 requests==2.31.0
 
-# Kaggle CLI
-kaggle==2.1.2
-
-# Optional S3 support (lazy-imported — only needed when STORAGE_BACKEND=s3)
+# AWS (S3 storage backend + SageMaker Async Inference client)
 boto3==1.34.100

@@ -1,0 +1,31 @@
+# DCI-VTON SageMaker inference configuration.
+#
+# NOTE: the DCI model *architecture* config (configs/viton512.yaml) is
+# provided by the cloned DCI-VTON repo at runtime/build time and is NOT
+# duplicated here. This file holds only the deployment-level knobs that
+# mirror the hard-coded values in the original gpu_inference.py pipeline.
+
+model:
+  # On SageMaker these are read from the extracted model dir (/opt/ml/model).
+  weights_dir: "/opt/ml/model"
+  viton_checkpoint: "viton512.ckpt"
+  warp_checkpoint: "warp_viton.pth"
+  densepose_checkpoint: "densepose_rcnn_R_50_FPN_s1x.pkl"   # auto-downloaded if absent
+  device: "cuda"
+
+repos:
+  # Baked into the image at build time (see Dockerfile). If empty, the
+  # loader clones them into the workspace at runtime (slower cold start).
+  repos_dir: "/opt/ml/repos"
+  workspace: "/tmp/vton_workspace"
+
+inference:
+  image_size: 512
+  ddim_num_steps: 50
+  n_steps: 20
+  unconditional_guidance_scale: 12.0
+  ddim_eta: 0.0
+
+postprocess:
+  color_correct: true
+  composite_feather: true

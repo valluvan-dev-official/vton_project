@@ -1,0 +1,32 @@
+# DCI-VTON SageMaker inference dependencies.
+#
+# torch / torchvision / torchaudio are provided by the CUDA base image
+# (see Dockerfile) and are intentionally NOT pinned here to avoid
+# clobbering the CUDA-matched build.
+
+# ── DCI-VTON / Stable Diffusion stack (mirrors api/requirements-gpu.txt) ──
+omegaconf==2.1.1
+einops
+transformers==4.46.3
+albumentations
+ftfy
+regex
+fvcore
+iopath
+open-clip-torch
+kornia
+torchmetrics
+pytorch-lightning==1.4.2
+git+https://github.com/openai/CLIP.git
+git+https://github.com/facebookresearch/detectron2.git
+
+# ── Image / array processing ──
+numpy==1.26.4
+pillow==10.3.0
+opencv-python-headless==4.9.0.80
+scikit-image==0.23.2
+
+# ── SageMaker serving (TorchServe-based PyTorch inference toolkit) ──
+sagemaker-inference
+multi-model-server
+requests-toolbelt

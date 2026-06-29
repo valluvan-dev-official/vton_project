@@ -1,0 +1,9 @@
+# Model weights are large — staged here but never committed.
+checkpoints/*.ckpt
+checkpoints/*.pth
+checkpoints/*.pkl
+checkpoints/*.bin
+checkpoints/*.safetensors
+model.tar.gz
+__pycache__/
+*.pyc
