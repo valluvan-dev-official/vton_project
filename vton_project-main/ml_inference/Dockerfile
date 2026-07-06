@@ -1,17 +1,25 @@
 # ── DCI-VTON SageMaker Async Inference image ─────────────────────────────────
 #
 # Base: AWS Deep Learning Container for SageMaker PyTorch *inference*.
-# It ships CUDA 12.1 + cuDNN + PyTorch 2.1 + TorchServe + the
-# sagemaker-pytorch-inference toolkit, which discovers and invokes the
-# four handlers in inference.py (model_fn / input_fn / predict_fn /
-# output_fn). The `serve` entrypoint is provided by the base image.
+# Pulled from the private DLC registry (763104351884) — must log in first:
+#   aws ecr get-login-password --region $REGION | \
+#     docker login --username AWS --password-stdin \
+#     763104351884.dkr.ecr.$REGION.amazonaws.com
 #
-# Build (must `aws ecr get-login-password` against 763104351884 first):
-#   docker build -t dci-vton-sagemaker \
-#     --build-arg REGION=us-east-1 -f ml_inference/Dockerfile ml_inference
+# Tag verified to exist in ap-south-1 via:
+#   aws ecr describe-images --registry-id 763104351884 \
+#     --region ap-south-1 --repository-name pytorch-inference \
+#     --image-ids imageTag=2.1.0-gpu-py310-cu118-ubuntu20.04-sagemaker
 #
-ARG REGION=us-east-1
-FROM 763104351884.dkr.ecr.${REGION}.amazonaws.com/pytorch-inference:2.1.0-gpu-py310-cu121-ubuntu20.04-sagemaker
+# Ships: CUDA 11.8 + cuDNN + PyTorch 2.1 + TorchServe +
+#        sagemaker-pytorch-inference toolkit (model_fn/input_fn/predict_fn/output_fn).
+#        The `serve` entrypoint is provided by the base image.
+#
+# Build (run build_and_push.ps1 which handles the login automatically):
+#   .\build_and_push.ps1 -AccountId 133946906587 -Region ap-south-1
+#
+ARG REGION=ap-south-1
+FROM 763104351884.dkr.ecr.${REGION}.amazonaws.com/pytorch-inference:2.1.0-gpu-py310-cu118-ubuntu20.04-sagemaker
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -25,21 +33,32 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9" \
     FORCE_CUDA=1
 
-# ── System deps (OpenCV, git for repo clones, build tools for detectron2) ──
+# ── System deps ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglib2.0-0 git build-essential ninja-build curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python deps ──
-COPY requirements.txt /opt/ml/requirements.txt
-RUN pip install --no-cache-dir -r /opt/ml/requirements.txt
-
-# ── Bake third-party source repos at build time (no runtime git clone) ──
+# ── Bake third-party source repos at build time (cloned before pip install
+#    so this layer is not invalidated by requirements.txt changes, and so
+#    the detectron2 source tree is present for the wheel install step below) ──
 RUN mkdir -p ${VTON_REPOS_DIR} \
     && git clone --depth=1 https://github.com/bcmi/DCI-VTON-Virtual-Try-On.git ${VTON_REPOS_DIR}/DCI-VTON-Virtual-Try-On \
     && git clone --depth=1 https://github.com/CompVis/taming-transformers.git   ${VTON_REPOS_DIR}/taming-transformers \
-    && git clone --depth=1 https://github.com/geyuying/PF-AFN.git                ${VTON_REPOS_DIR}/PF-AFN \
-    && git clone --depth=1 https://github.com/facebookresearch/detectron2.git    ${VTON_REPOS_DIR}/detectron2_repo
+    && git clone --depth=1 https://github.com/geyuying/PF-AFN.git               ${VTON_REPOS_DIR}/PF-AFN \
+    && git clone --depth=1 https://github.com/facebookresearch/detectron2.git   ${VTON_REPOS_DIR}/detectron2_repo
+
+# ── Python deps (detectron2 excluded — see next step) ──
+COPY requirements.txt /opt/ml/requirements.txt
+RUN pip install --no-cache-dir -r /opt/ml/requirements.txt
+
+# ── Detectron2: build and install from the already-cloned local source tree.
+#    No official prebuilt wheel exists for PyTorch 2.x (last release: v0.6, 2021).
+#    The editable install (-e) compiles the detectron2._C CUDA extension in-place,
+#    which DefaultPredictor requires. The same source tree also provides:
+#      - projects/DensePose/ (added to sys.path by model_loader.py::load_densepose)
+#      - projects/DensePose/configs/*.yaml (read by cfg.merge_from_file at startup)
+#    Both the compiled extension and the source tree layout are required. ──
+RUN pip install --no-cache-dir -e ${VTON_REPOS_DIR}/detectron2_repo
 
 # ── Warm the SegFormer weights into the image so cold start is offline ──
 RUN python -c "from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation; \
