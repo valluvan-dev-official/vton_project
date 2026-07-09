@@ -48,8 +48,8 @@ RUN mkdir -p ${VTON_REPOS_DIR} \
     && git clone --depth=1 https://github.com/facebookresearch/detectron2.git   ${VTON_REPOS_DIR}/detectron2_repo
 
 # ── Python deps (detectron2 excluded — see next step) ──
-COPY requirements.txt /opt/ml/requirements.txt
-RUN pip install --no-cache-dir -r /opt/ml/requirements.txt
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # ── Detectron2: build and install from the already-cloned local source tree.
 #    No official prebuilt wheel exists for PyTorch 2.x (last release: v0.6, 2021).
@@ -65,12 +65,64 @@ RUN python -c "from transformers import SegformerImageProcessor, SegformerForSem
     SegformerImageProcessor.from_pretrained('mattmdjaga/segformer_b2_clothes'); \
     SegformerForSemanticSegmentation.from_pretrained('mattmdjaga/segformer_b2_clothes')"
 
-# ── Inference code — SageMaker toolkit looks in /opt/ml/code ──
+# ── Install the ml_inference package ─────────────────────────────────────────
+#
+#  1. Copy the entire ml_inference/ build context (which contains setup.py
+#     and the ml_inference/ sub-package) to a staging directory.
+#  2. pip install -e installs it into site-packages so that anywhere inside
+#     the container `import ml_inference` resolves correctly.
+#  3. Copy inference.py (the SageMaker SAGEMAKER_PROGRAM entry point) to
+#     /opt/ml/code/ where the toolkit expects it.
+#
+#  Layout after this block:
+#    /tmp/ml_inference_src/          <- package source (editable install target)
+#      setup.py
+#      inference.py
+#      ml_inference/
+#        __init__.py
+#        predictor.py
+#        preprocess.py
+#        postprocess.py
+#        model_loader.py
+#    /opt/ml/code/
+#      inference.py                  <- toolkit entry point (SAGEMAKER_PROGRAM)
+#
+COPY . /tmp/ml_inference_src/
+RUN pip install --no-cache-dir -e /tmp/ml_inference_src/
+
+RUN mkdir -p /opt/ml/code && \
+    cp /tmp/ml_inference_src/inference.py /opt/ml/code/inference.py
+
+# Sanity-check: confirm the package and entry point are importable.
+# This runs at image build time — a failure here aborts the build immediately
+# and surfaces the error before any ECR push or SageMaker deploy.
+RUN python - <<'EOF'
+import sys
+
+# 1. Package must be importable from anywhere (installed into site-packages)
+import ml_inference
+print("OK: import ml_inference ->", ml_inference.__file__)
+
+# 2. Entry point must be importable as a top-level module (toolkit does this)
+sys.path.insert(0, "/opt/ml/code")
+import inference
+print("OK: import inference ->", inference.__file__)
+
+# 3. All four SageMaker handler functions must exist
+for fn in ("model_fn", "input_fn", "predict_fn", "output_fn"):
+    assert callable(getattr(inference, fn)), f"MISSING: inference.{fn}"
+    print(f"OK: inference.{fn} is callable")
+
+# 4. VTONPredictor must be importable from the package
+from ml_inference.predictor import VTONPredictor
+print("OK: VTONPredictor importable")
+
+print("\nAll import checks passed.")
+EOF
+
+# ── SageMaker toolkit environment ────────────────────────────────────────────
 ENV SAGEMAKER_PROGRAM=inference.py \
     SAGEMAKER_SUBMIT_DIRECTORY=/opt/ml/code
-COPY . /opt/ml/code/
-# Make the package importable both as `ml_inference.*` and as top-level modules.
-RUN cp -r /opt/ml/code /opt/ml/code/ml_inference 2>/dev/null || true
 
 # ── Health check — TorchServe ping endpoint used by SageMaker ──
 HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \

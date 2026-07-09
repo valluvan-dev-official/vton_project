@@ -1,23 +1,32 @@
 """
 inference.py — SageMaker inference entry point (BYOC / PyTorch toolkit).
 
-Implements the four functions the SageMaker PyTorch inference toolkit
-(TorchServe) calls:
+This file is the SageMaker SAGEMAKER_PROGRAM entry point.  It lives at
+/opt/ml/code/inference.py inside the container and is imported by the
+SageMaker PyTorch inference toolkit as a top-level module.
+
+The ml_inference package is installed via `pip install -e .` in the
+Dockerfile, so all imports below use the installed package name:
+
+    from ml_inference.predictor import VTONPredictor
+
+There are NO relative imports and NO try/except ImportError fallbacks.
+
+Implements the four functions the SageMaker PyTorch inference toolkit calls:
 
     model_fn(model_dir)                  -> load all models ONCE at startup
     input_fn(request_body, content_type) -> parse person + garment images
     predict_fn(input_data, model)        -> run the try-on pipeline
     output_fn(prediction, accept)        -> serialize the result image
 
-Key guarantees required by the task:
+Key guarantees:
   * All AI models are loaded a single time in model_fn (process lifetime).
   * Checkpoints are NEVER reloaded per request.
   * Models stay resident in GPU memory between requests.
 
 Request formats accepted by input_fn:
-  * multipart/form-data  with fields `person_image` and `garment_image`
   * application/json      {"person": "<b64>", "garment": "<b64>", "job_id": "..."}
-  * application/x-npy / octet-stream are NOT supported (images only)
+  * multipart/form-data   with fields `person_image` and `garment_image`
 
 Response (output_fn):
   * accept image/jpeg          -> raw JPEG bytes
@@ -33,12 +42,9 @@ import os
 
 from PIL import Image
 
-# Support both `python -m ml_inference.inference` (package import) and the
-# SageMaker toolkit loading this file as a top-level module.
-try:
-    from .predictor import VTONPredictor
-except ImportError:  # pragma: no cover - toolkit loads as top-level module
-    from predictor import VTONPredictor
+# Absolute import — works because `pip install -e .` installs ml_inference
+# into the container's site-packages at Docker build time.
+from ml_inference.predictor import VTONPredictor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,7 +53,6 @@ JPEG_CONTENT_TYPE = "image/jpeg"
 JSON_CONTENT_TYPE = "application/json"
 
 # Where the third-party repos are baked into the image (see Dockerfile).
-# Falls back to a runtime clone inside the workspace if unset.
 _REPOS_DIR = os.getenv("VTON_REPOS_DIR") or None
 _WORKSPACE = os.getenv("VTON_WORKSPACE", "/tmp/vton_workspace")
 
@@ -100,7 +105,6 @@ def input_fn(request_body, content_type: str = JSON_CONTENT_TYPE) -> dict:
         }
 
     if content_type.startswith("multipart/form-data"):
-        # Parse multipart without extra deps using the email parser.
         from requests_toolbelt.multipart import decoder as _decoder  # type: ignore
         multipart = _decoder.MultipartDecoder(
             request_body if isinstance(request_body, (bytes, bytearray)) else request_body.encode(),

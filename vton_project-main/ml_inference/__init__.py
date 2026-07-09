@@ -1,16 +1,17 @@
 """
-ml_inference — Kaggle-free, SageMaker-ready DCI-VTON inference package.
+ml_inference/__init__.py (top-level, build-context root)
 
-This package is a structural refactor of `ml/scripts/gpu_inference.py`.
-The model math is unchanged; it is split into:
+NOTE: This file is at the ROOT of the ml_inference/ build context directory
+(i.e. vton_project-main/ml_inference/__init__.py).  It is NOT the package
+__init__.py.
 
-    model_loader.py  — load every model once (ModelBundle)
-    preprocess.py    — segmentation, mask, densepose, warp
-    postprocess.py   — color correction + composite
-    predictor.py     — VTONPredictor: orchestrates the full pipeline
-    inference.py     — SageMaker handlers (model_fn / input_fn / predict_fn / output_fn)
+The actual Python package __init__.py lives at:
+  ml_inference/ml_inference/__init__.py
+
+This file exists only so that local development imports
+`import ml_inference` from the project root still work via the
+editable install (`pip install -e .`), which installs the INNER
+ml_inference/ directory (discovered by find_packages() in setup.py).
+
+Do NOT add code here — it is not part of the installed package.
 """
-from .model_loader import ModelBundle, load_all_models, SIZE
-from .predictor import VTONPredictor
-
-__all__ = ["ModelBundle", "load_all_models", "VTONPredictor", "SIZE"]

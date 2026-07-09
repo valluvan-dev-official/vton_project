@@ -1,0 +1,40 @@
+# ── .dockerignore — ml_inference build context ───────────────────────────────
+#
+# Keep the Docker build context lean.  The checkpoints (viton512.ckpt,
+# warp_viton.pth, model.tar.gz) must NOT be in the image — they are
+# packaged separately into model.tar.gz and uploaded to S3.
+# SageMaker downloads model.tar.gz at startup and extracts it to /opt/ml/model.
+#
+
+# Large weight files — packaged into model.tar.gz, served from S3
+checkpoints/
+*.ckpt
+*.pth
+*.pkl
+model.tar.gz
+
+# Python byte-code caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Dev / repo artifacts
+.git/
+.gitignore
+*.md
+MIGRATION_REPORT.md
+
+# Configs directory is only needed at runtime (loaded from model_dir or repo)
+# so exclude it from the image build context.
+# configs/   # keep commented if your Dockerfile references configs at build time
+
+# IDE / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
