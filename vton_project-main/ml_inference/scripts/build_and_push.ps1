@@ -16,6 +16,13 @@
 # provenance/SBOM attestations, force linux/amd64, and force Docker (not OCI)
 # media types on the output so the final pushed manifest is schema2 v2.
 #
+# NOTE: --provenance=false --sbom=false alone is not always sufficient — on
+# some buildx/BuildKit versions the image exporter still defaults to OCI
+# media types because the attestation subsystem's default is set at the
+# builder level, not just per-build. BUILDX_NO_DEFAULT_ATTESTATIONS=1 kills
+# that default outright; combined with oci-mediatypes=false on the exporter,
+# this reliably yields application/vnd.docker.distribution.manifest.v2+json.
+#
 # Prerequisites (run manually before this script):
 #   aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 763104351884.dkr.ecr.ap-south-1.amazonaws.com
 #   aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin <AccountId>.dkr.ecr.ap-south-1.amazonaws.com
@@ -46,6 +53,11 @@ if ($LASTEXITCODE -ne 0) {
     aws ecr create-repository --region $Region --repository-name $RepoName
 }
 
+# Must be set before the builder is created AND before the build runs — this
+# disables BuildKit's default attestation behavior at the source, rather than
+# relying solely on the per-build --provenance/--sbom flags.
+$env:BUILDX_NO_DEFAULT_ATTESTATIONS = "1"
+
 Write-Host "==> 2/4 Ensuring buildx builder '$BuilderName' (docker-container driver) exists"
 docker buildx inspect $BuilderName *>$null
 if ($LASTEXITCODE -ne 0) {
@@ -62,8 +74,9 @@ docker buildx build `
     --sbom=false `
     --build-arg REGION=$Region `
     -t "${RepoName}:${Tag}" `
+    -t "${EcrUri}:${Tag}" `
     -f (Join-Path $MlInferenceDir "Dockerfile") `
-    --output "type=image,name=${EcrUri}:${Tag},push=true,oci-mediatypes=false" `
+    --output "type=image,push=true,oci-mediatypes=false" `
     $MlInferenceDir
 if ($LASTEXITCODE -ne 0) { throw "docker buildx build failed" }
 
