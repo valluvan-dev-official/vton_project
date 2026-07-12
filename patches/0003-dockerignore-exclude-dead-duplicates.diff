@@ -1,0 +1,22 @@
+diff --git a/vton_project-main/ml_inference/.dockerignore b/vton_project-main/ml_inference/.dockerignore
+--- a/vton_project-main/ml_inference/.dockerignore
++++ b/vton_project-main/ml_inference/.dockerignore
+@@ -29,6 +29,18 @@
+ *.md
+ MIGRATION_REPORT.md
+ 
++# Dead duplicate top-level files -- superseded by the real installed package
++# at ml_inference/ml_inference/*.py (the one find_packages() in setup.py
++# discovers and pip installs). These root-level copies are never imported by
++# inference.py and have already drifted from the package versions once
++# (predictor.py here uses a relative import; the package's predictor.py uses
++# an absolute one). Excluding them keeps the build context honest without
++# deleting anything.
++/model_loader.py
++/predictor.py
++/preprocess.py
++/postprocess.py
++
+ # Configs directory is only needed at runtime (loaded from model_dir or repo)
+ # so exclude it from the image build context.
+ # configs/   # keep commented if your Dockerfile references configs at build time

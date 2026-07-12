@@ -1,0 +1,39 @@
+diff --git a/vton_project-main/ml_inference/Dockerfile b/vton_project-main/ml_inference/Dockerfile
+--- a/vton_project-main/ml_inference/Dockerfile
++++ b/vton_project-main/ml_inference/Dockerfile
+@@ -28,6 +28,9 @@
+     VTON_WORKSPACE=/tmp/vton_workspace \
+     HF_HOME=/opt/ml/hf_cache \
+     TRANSFORMERS_CACHE=/opt/ml/hf_cache \
++    # torchvision model-zoo cache (VGG19 perceptual weights used by
++    # model_loader.py::load_dci) -- baked below, same rationale as HF_HOME.
++    TORCH_HOME=/opt/ml/torch_cache \
+     # Detectron2 builds CUDA ops — target common SageMaker GPUs
+     # (T4=7.5, A10G=8.6, V100=7.0, L4=8.9)
+     TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9" \
+@@ -65,6 +68,25 @@
+     SegformerImageProcessor.from_pretrained('mattmdjaga/segformer_b2_clothes'); \
+     SegformerForSemanticSegmentation.from_pretrained('mattmdjaga/segformer_b2_clothes')"
+ 
++# -- Warm the CLIP vision weights and VGG19 perceptual weights that
++#    model_loader.py::load_dci pulls at runtime. Today NEITHER is baked into
++#    the image (only SegFormer is warmed above), so both are downloaded over
++#    the network on every fresh container -- this fails outright in
++#    network-isolated SageMaker deployments and adds latency/flakiness
++#    everywhere else. The CLIP checkpoint id below is DCI-VTON's documented
++#    default; if the cloned repo's configs/viton512.yaml references a
++#    different id, this warm-up is a harmless no-op miss (the real one still
++#    downloads once at runtime, exactly like today) -- it cannot regress
++#    cold start, only improve or leave it unchanged.
++RUN python -c "from transformers import CLIPVisionModel; \
++    CLIPVisionModel.from_pretrained('openai/clip-vit-large-patch14')" \
++ && python -c "import torchvision.models as m; m.vgg19(weights=m.VGG19_Weights.DEFAULT)"
++
++# -- Every model above is now cached: force offline mode so `from_pretrained`
++#    never attempts a revision-check network call at cold start. --
++ENV HF_HUB_OFFLINE=1 \
++    TRANSFORMERS_OFFLINE=1
++
+ # ── Install the ml_inference package ─────────────────────────────────────────
+ #
+ #  1. Copy the entire ml_inference/ build context (which contains setup.py
