@@ -41,8 +41,10 @@ def on_worker_ready(sender, **kwargs):
         logger.info("=" * 60)
     except Exception as exc:
         logger.error("=" * 60)
-        logger.error("worker_startup: FATAL — GPU engine initialisation failed: %s", exc)
+        logger.error("worker_startup: FATAL — GPU engine initialisation failed.")
         logger.error("worker_startup: Worker will exit to prevent silent failures.")
         logger.error("=" * 60)
+        # Log the complete traceback with logger.exception()
+        logger.exception("Full traceback:")
         # Re-raise so Celery/Docker marks the container as failed and restarts it.
         raise SystemExit(1) from exc
