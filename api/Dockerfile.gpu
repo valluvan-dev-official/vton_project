@@ -11,10 +11,25 @@ FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 git build-essential \
-    libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
-    libswscale-dev libswresample-dev libavfilter-dev && \
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Kolkata
+
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        tzdata \
+        libgl1 \
+        libglib2.0-0 \
+        git \
+        build-essential \
+        libavformat-dev \
+        libavcodec-dev \
+        libavdevice-dev \
+        libavutil-dev \
+        libavfilter-dev \
+        libswscale-dev \
+        libswresample-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python deps (API + GPU inference stack)
