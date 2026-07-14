@@ -11,6 +11,9 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       LOCAL_STORAGE_PATH: /app/storage
+      STORAGE_BACKEND: s3
+      S3_BUCKET: amazon-sagemaker-960583974175-ap-south-1-ban3nm5kd4wvi9
+      S3_REGION: ap-south-1
     volumes:
       - ../storage:/app/storage
     depends_on:
@@ -30,12 +33,19 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       LOCAL_STORAGE_PATH: /app/storage
+      STORAGE_BACKEND: s3
+      S3_BUCKET: amazon-sagemaker-960583974175-ap-south-1-ban3nm5kd4wvi9
+      S3_REGION: ap-south-1
+      MODEL_S3_TAR: model/model.tar.gz
       DEVICE: cuda
       WEIGHTS_DIR: /app/ml/weights
       WORKSPACE: /tmp/vton_workspace
     volumes:
       - ../storage:/app/storage
       - ../ml:/app/ml
+      # ml_weights is a named volume so the downloaded model persists across
+      # container restarts (avoids re-downloading ~4 GB on every restart).
+      - ml_weights:/app/ml/weights
     deploy:
       resources:
         reservations:
@@ -48,7 +58,26 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A app.workers.tasks.celery_app worker --loglevel=info --pool=solo
+    # -I app.workers.worker_startup registers the worker_ready signal handler
+    # which bootstraps the model and pre-loads the GPU engine before the worker
+    # starts accepting tasks.
+    command: >
+      celery -A app.workers.tasks.celery_app worker
+      --loglevel=info
+      --pool=solo
+      -I app.workers.worker_startup
+    # Healthcheck: ask Celery to ping the worker every 60 s.
+    # Fails if the worker hasn't accepted a ping within 10 s.
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "from app.workers.tasks import celery_app; r = celery_app.control.ping(timeout=10); exit(0 if r else 1)"
+      interval: 60s
+      timeout: 15s
+      start_period: 300s   # allow 5 min for model bootstrap + GPU load on first start
+      retries: 3
 
   flower:
     build:
@@ -92,6 +121,10 @@ services:
 
 volumes:
   pg_data:
+  # Named volume so downloaded model weights persist across worker restarts.
+  # On EC2 this avoids re-downloading 4 GB from S3 every time the container
+  # is restarted (e.g. after a code-only rebuild).
+  ml_weights:
 
 networks:
   default:

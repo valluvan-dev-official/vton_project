@@ -2,13 +2,20 @@
 Celery tasks for async try-on job processing.
 
 Flow:
-  1. Run inference (placeholder or real model)
-  2. Calculate SSIM quality score vs the person image
-  3. If score >= MIN_QUALITY_SCORE → auto-save as training pair + update pairs.json
-  4. Update job status in DB
+  1. Download person + garment from S3 to temp local files
+  2. Run GPU inference (GPUInferenceEngine singleton)
+  3. Upload result to S3
+  4. Calculate SSIM quality score
+  5. If score >= MIN_QUALITY_SCORE → auto-save as training pair + update pairs.json
+  6. Update job status in DB (result_image_path stores the S3 key)
+
+When STORAGE_BACKEND=local the download/upload steps are no-ops that just
+copy from/to LOCAL_STORAGE_PATH, so the local dev workflow is unchanged.
 """
 import json
+import os
 import sys
+import tempfile
 import uuid
 
 if sys.platform != "win32":
@@ -81,9 +88,10 @@ def _save_training_pair(job_id: str, person_path: str, garment_path: str,
     """
     Copy the trio to storage/training_pairs/<job_id>/ and append to pairs.json.
     ml/src/data/dataset.py reads from this directory.
+    With S3 backend the files are uploaded to S3_PREFIX_TRAINING/<job_id>/.
     """
     storage = get_storage()
-    pair_dir = f"training_pairs/{job_id}"
+    pair_dir = f"{settings.S3_PREFIX_TRAINING}/{job_id}"
 
     person_key  = f"{pair_dir}/person{Path(person_path).suffix}"
     garment_key = f"{pair_dir}/garment{Path(garment_path).suffix}"
@@ -93,16 +101,16 @@ def _save_training_pair(job_id: str, person_path: str, garment_path: str,
     storage.save(garment_path, garment_key)
     storage.save(result_path,  result_key)
 
-    # Per-pair meta file
+    # Per-pair meta file — written locally and also uploaded
     meta = {
-        "job_id":      job_id,
+        "job_id":        job_id,
         "quality_score": score,
-        "person":      person_key,
-        "garment":     garment_key,
-        "result":      result_key,
-        "saved_at":    datetime.utcnow().isoformat(),
+        "person":        person_key,
+        "garment":       garment_key,
+        "result":        result_key,
+        "saved_at":      datetime.utcnow().isoformat(),
     }
-    meta_path = Path(settings.LOCAL_STORAGE_PATH) / pair_dir / "meta.json"
+    meta_path = Path(settings.LOCAL_STORAGE_PATH) / "training_pairs" / job_id / "meta.json"
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2))
 
@@ -135,54 +143,118 @@ def _save_training_pair(job_id: str, person_path: str, garment_path: str,
         pairs_json.write_text(json.dumps(existing, indent=2))
 
 
+# ── S3 input helpers ──────────────────────────────────────────────────────────
+
+def _resolve_local_path(s3_key_or_path: str, job_id: str, role: str) -> str:
+    """Ensure the image is available as a local file and return its path.
+
+    If STORAGE_BACKEND=s3 and the value looks like an S3 key (no leading /),
+    download it to a temp file and return that path.
+
+    If STORAGE_BACKEND=local or the path already exists, return it as-is
+    (after the /app/storage path-fix for Docker vs host differences).
+    """
+    p = s3_key_or_path
+
+    # Docker path fix (kept from original implementation)
+    if p.startswith("/app/storage/") and not Path(p).exists():
+        p = p.replace("/app/storage", str(settings.LOCAL_STORAGE_PATH), 1)
+
+    if Path(p).exists():
+        return p
+
+    # Treat as S3 key — download to a temp file
+    import logging
+    logger = logging.getLogger(__name__)
+    storage = get_storage()
+    suffix = Path(p).suffix or ".jpg"
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=suffix, delete=False,
+        dir=Path(settings.LOCAL_STORAGE_PATH) / "tmp",
+        prefix=f"{job_id}_{role}_",
+    )
+    tmp.close()
+    logger.info("tasks: Downloading input (%s) from storage key %s...", role, p)
+    storage.load(p, tmp.name)
+    return tmp.name
+
+
 # ── Main Celery task ──────────────────────────────────────────────────────────
 
 @celery_app.task(bind=True, name="tasks.process_tryon_job", max_retries=2)
 def process_tryon_job(self, job_id: str, person_image_path: str, garment_image_path: str):
     """
     Main try-on pipeline:
-      1. Run inference (placeholder draws text + pastes garment, sleeps 3 s)
-      2. SSIM quality score
-      3. Auto-save training pair when score >= MIN_QUALITY_SCORE
-      4. Update DB — completed / failed
+      1. Resolve input images (download from S3 if needed)
+      2. Run GPU inference — singleton engine, models loaded once
+      3. Upload result to S3
+      4. SSIM quality score
+      5. Auto-save training pair when score >= MIN_QUALITY_SCORE
+      6. Update DB — completed / failed
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    tmp_files: list[str] = []   # track temp files to clean up
+
     try:
         _update_job(job_id, {"status": "processing"})
 
-        # Translate Docker paths (/app/storage/...) to host paths when running outside Docker
-        def _fix_path(p: str) -> str:
-            if p.startswith("/app/storage/") and not Path(p).exists():
-                return p.replace("/app/storage", str(settings.LOCAL_STORAGE_PATH), 1)
-            return p
+        # ── 1. Resolve local paths for inference ──────────────────────────
+        # Create tmp dir inside LOCAL_STORAGE_PATH (always accessible)
+        tmp_dir = Path(settings.LOCAL_STORAGE_PATH) / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        person_image_path  = _fix_path(person_image_path)
-        garment_image_path = _fix_path(garment_image_path)
+        local_person  = _resolve_local_path(person_image_path,  job_id, "person")
+        local_garment = _resolve_local_path(garment_image_path, job_id, "garment")
 
-        # 1. Inference
-        output_path = str(
-            Path(settings.LOCAL_STORAGE_PATH) / "outputs" / f"{job_id}.jpg"
-        )
-        # GPU local inference — models loaded once per worker process
-        _gpu_svc.run(person_image_path, garment_image_path, output_path, job_id=job_id)
+        # Track any temp files created by _resolve_local_path
+        for p in (local_person, local_garment):
+            if str(tmp_dir) in p:
+                tmp_files.append(p)
+
+        # ── 2. Inference ──────────────────────────────────────────────────
+        output_path = str(tmp_dir / f"{job_id}_output.jpg")
+        logger.info("tasks: Starting inference for job %s...", job_id)
+        _gpu_svc.run(local_person, local_garment, output_path, job_id=job_id)
         # [SAGEMAKER] router = get_inference_router(); router.run(...)  # re-enable for SageMaker
+        logger.info("tasks: Inference complete for job %s.", job_id)
 
-        # 2. SSIM score
-        score = _compute_ssim(person_image_path, output_path)
+        # ── 3. Upload result to S3 ────────────────────────────────────────
+        result_s3_key = f"{settings.S3_PREFIX_OUTPUT}/{job_id}.jpg"
+        storage = get_storage()
+        logger.info("tasks: Uploading output to S3 key %s...", result_s3_key)
+        storage.save(output_path, result_s3_key)
+        logger.info("tasks: Output uploaded — s3://%s/%s", settings.S3_BUCKET, result_s3_key)
 
-        # 3. Training pair auto-save
+        # result_image_path stores the S3 key (or local path in local mode)
+        result_image_path = storage.url(result_s3_key)
+
+        # ── 4. SSIM score ─────────────────────────────────────────────────
+        score = _compute_ssim(local_person, output_path)
+        logger.info("tasks: SSIM score for job %s: %.4f", job_id, score)
+
+        # ── 5. Training pair auto-save ────────────────────────────────────
         saved = False
         if score >= settings.MIN_QUALITY_SCORE:
-            _save_training_pair(job_id, person_image_path, garment_image_path, output_path, score)
+            _save_training_pair(job_id, local_person, local_garment, output_path, score)
             saved = True
 
-        # 4. Mark completed
+        # ── 6. Mark completed ─────────────────────────────────────────────
         _update_job(job_id, {
-            "status":           "completed",
-            "result_image_path": output_path,
-            "quality_score":    score,
+            "status":            "completed",
+            "result_image_path": result_image_path,
+            "quality_score":     score,
             "saved_as_training": saved,
         })
 
     except Exception as exc:
         _update_job(job_id, {"status": "failed", "error_message": str(exc)})
         raise self.retry(exc=exc, countdown=30)
+
+    finally:
+        # Clean up temp files created for S3-backend input downloads
+        for p in tmp_files:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass

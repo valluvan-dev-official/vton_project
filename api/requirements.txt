@@ -23,5 +23,5 @@ python-multipart==0.0.9
 httpx==0.27.0
 requests==2.31.0
 
-# AWS (S3 storage backend + SageMaker client) — uncomment if using S3 or SageMaker
-# boto3==1.34.100
+# AWS — S3 storage backend, model bootstrap (EC2 IAM role; no credentials needed on EC2)
+boto3==1.34.100

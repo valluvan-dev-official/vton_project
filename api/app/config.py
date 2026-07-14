@@ -15,27 +15,41 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = "redis://redis:6379/0"
 
     # Storage
-    STORAGE_BACKEND: str = "local"          # "local" | "s3"
+    STORAGE_BACKEND: str = "s3"             # "local" | "s3"
     LOCAL_STORAGE_PATH: str = "/app/storage"
 
-    # S3 (only needed when STORAGE_BACKEND=s3)
-    S3_BUCKET: str = ""
-    S3_REGION: str = "us-east-1"
-    AWS_ACCESS_KEY_ID: str = ""
-    AWS_SECRET_ACCESS_KEY: str = ""
+    # S3
+    # On EC2 the IAM instance profile is used automatically by boto3.
+    # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are NOT required and should
+    # NOT be set in production.  They are accepted here so local development
+    # against a real bucket still works when credentials are in the environment.
+    S3_BUCKET: str = "amazon-sagemaker-960583974175-ap-south-1-ban3nm5kd4wvi9"
+    S3_REGION: str = "ap-south-1"
+    AWS_ACCESS_KEY_ID: str = ""      # leave blank on EC2 (uses instance profile)
+    AWS_SECRET_ACCESS_KEY: str = ""  # leave blank on EC2 (uses instance profile)
+
+    # S3 folder prefixes (no trailing slash)
+    S3_PREFIX_INPUT_PERSON:  str = "input/person"
+    S3_PREFIX_INPUT_GARMENT: str = "input/garment"
+    S3_PREFIX_OUTPUT:        str = "output"
+    S3_PREFIX_TRAINING:      str = "shared/training_pairs"
 
     # ── GPU EC2 local inference ──────────────────────────────────────────────
-    # These replace the SageMaker settings for single-GPU-EC2 deployments.
-    DEVICE: str = "cuda"                   # "cuda" on GPU instance; "cpu" for local testing
-    WEIGHTS_DIR: str = "/app/ml/weights"   # directory with viton512.ckpt + warp_viton.pth
-    WORKSPACE: str = "/tmp/vton_workspace" # temp dir for repo clones and model artefacts
+    DEVICE:      str = "cuda"                   # "cuda" on GPU instance; "cpu" for testing
+    WEIGHTS_DIR: str = "/app/ml/weights"        # viton512.ckpt + warp_viton.pth live here
+    WORKSPACE:   str = "/tmp/vton_workspace"    # temp dir for repo clones / artefacts
+
+    # ── Model bootstrap ──────────────────────────────────────────────────────
+    # S3 key of the model archive downloaded when WEIGHTS_DIR is empty.
+    # Set to "" to disable automatic download (weights must be present already).
+    MODEL_S3_TAR: str = "model/model.tar.gz"
 
     # Retained for backward compatibility (not used in GPU-EC2 mode)
     USE_OWN_MODEL: bool = False
-    MODEL_PATH: str = ""
+    MODEL_PATH:    str  = ""
 
     # Quality threshold — results with SSIM >= this auto-save as training pairs
-    MIN_QUALITY_SCORE: float = 0.65
+    MIN_QUALITY_SCORE:          float = 0.65
     TRAINING_PAIR_SSIM_THRESHOLD: float = 0.65
 
     # API limits
