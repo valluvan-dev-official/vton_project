@@ -1,3 +1,12 @@
+# ── DCI-VTON GPU Worker / API image ──────────────────────────────────────────
+#
+# Build context: project root (one level above api/)
+#   docker compose -f api/docker-compose.gpu.yml build
+#
+# The ml/ directory is NOT copied into the image at build time — it is
+# volume-mounted at runtime (../ml:/app/ml in docker-compose.gpu.yml) so
+# model weights and scripts are shared without rebuilding the image.
+#
 FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
 
 WORKDIR /app
@@ -5,14 +14,17 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglib2.0-0 git build-essential && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-COPY requirements-gpu.txt .
+# Install Python deps (API + GPU inference stack)
+COPY api/requirements.txt     ./requirements.txt
+COPY api/requirements-gpu.txt ./requirements-gpu.txt
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir -r requirements-gpu.txt
 
-COPY . .
+# Copy FastAPI application code
+COPY api/ .
 
-# Copy ML scripts into the image
-COPY ../ml /app/ml
+# /app/ml is mounted at runtime — no COPY needed.
+# The worker reads WEIGHTS_DIR=/app/ml/weights and WORKSPACE=/tmp/vton_workspace
+# from environment (set in docker-compose.gpu.yml).
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

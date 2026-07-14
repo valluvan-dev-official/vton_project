@@ -32,6 +32,7 @@ services:
       LOCAL_STORAGE_PATH: /app/storage
       DEVICE: cuda
       WEIGHTS_DIR: /app/ml/weights
+      WORKSPACE: /tmp/vton_workspace
     volumes:
       - ../storage:/app/storage
       - ../ml:/app/ml

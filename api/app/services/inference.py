@@ -36,11 +36,15 @@ class InferenceRouter:
         device = os.getenv("DEVICE", "cpu").strip().lower()
         weights_dir = os.getenv("WEIGHTS_DIR", "").strip()
 
-        if _s.SAGEMAKER_ENDPOINT_NAME and _s.SAGEMAKER_S3_BUCKET:
-            self._mode = "sagemaker"
-            logger.info("InferenceRouter: SageMaker Async Inference mode active "
-                        f"(endpoint={_s.SAGEMAKER_ENDPOINT_NAME}).")
-        elif device == "cuda" and weights_dir and Path(weights_dir).exists():
+        # [SAGEMAKER] Disabled for GPU-EC2 deployment.
+        # To re-enable SageMaker, restore SAGEMAKER_ENDPOINT_NAME / SAGEMAKER_S3_BUCKET
+        # in config.py and .env, then remove the leading # from the block below.
+        # if _s.SAGEMAKER_ENDPOINT_NAME and _s.SAGEMAKER_S3_BUCKET:
+        #     self._mode = "sagemaker"
+        #     logger.info("InferenceRouter: SageMaker Async Inference mode active "
+        #                 f"(endpoint={_s.SAGEMAKER_ENDPOINT_NAME}).")
+        # elif device == "cuda" and weights_dir and Path(weights_dir).exists():
+        if device == "cuda" and weights_dir and Path(weights_dir).exists():
             self._mode = "local_gpu"
             logger.info("InferenceRouter: Local GPU mode — loading models...")
             try:
@@ -52,7 +56,7 @@ class InferenceRouter:
                 self._mode = "placeholder"
         else:
             logger.info("InferenceRouter: Placeholder mode "
-                        "(set SAGEMAKER_ENDPOINT_NAME + SAGEMAKER_S3_BUCKET to enable DCI-VTON).")
+                        "(set DEVICE=cuda + WEIGHTS_DIR to enable local GPU inference).")
 
         # Phase 4 — own model auto-load
         ckpt = os.getenv("OWN_MODEL_CHECKPOINT", "").strip()

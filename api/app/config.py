@@ -24,11 +24,15 @@ class Settings(BaseSettings):
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
 
-    # ML inference
+    # ── GPU EC2 local inference ──────────────────────────────────────────────
+    # These replace the SageMaker settings for single-GPU-EC2 deployments.
+    DEVICE: str = "cuda"                   # "cuda" on GPU instance; "cpu" for local testing
+    WEIGHTS_DIR: str = "/app/ml/weights"   # directory with viton512.ckpt + warp_viton.pth
+    WORKSPACE: str = "/tmp/vton_workspace" # temp dir for repo clones and model artefacts
+
+    # Retained for backward compatibility (not used in GPU-EC2 mode)
     USE_OWN_MODEL: bool = False
     MODEL_PATH: str = ""
-    DEVICE: str = "cpu"
-    WEIGHTS_DIR: str = ""
 
     # Quality threshold — results with SSIM >= this auto-save as training pairs
     MIN_QUALITY_SCORE: float = 0.65
@@ -37,13 +41,16 @@ class Settings(BaseSettings):
     # API limits
     MAX_UPLOAD_SIZE_MB: int = 10
 
-    # SageMaker Async Inference (DCI-VTON)
-    SAGEMAKER_ENDPOINT_NAME: str = ""
-    SAGEMAKER_REGION: str = "us-east-1"
-    SAGEMAKER_S3_BUCKET: str = ""
-    SAGEMAKER_ASYNC_INPUT_PREFIX: str = "dci-vton/async-input"
-    SAGEMAKER_POLL_INTERVAL_SECONDS: int = 5
-    SAGEMAKER_POLL_TIMEOUT_SECONDS: int = 900
+    # ── SageMaker Async Inference (disabled for GPU-EC2 deployment) ──────────
+    # To switch back to SageMaker, uncomment the fields below, populate .env,
+    # and restore the [SAGEMAKER] lines in tasks.py and inference.py.
+    #
+    # SAGEMAKER_ENDPOINT_NAME: str = ""
+    # SAGEMAKER_REGION: str = "us-east-1"
+    # SAGEMAKER_S3_BUCKET: str = ""
+    # SAGEMAKER_ASYNC_INPUT_PREFIX: str = "dci-vton/async-input"
+    # SAGEMAKER_POLL_INTERVAL_SECONDS: int = 5
+    # SAGEMAKER_POLL_TIMEOUT_SECONDS: int = 900
 
     class Config:
         env_file = str(_ENV_FILE)

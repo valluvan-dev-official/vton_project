@@ -21,7 +21,8 @@ from skimage.metrics import structural_similarity as ssim
 import numpy as np
 
 from app.config import get_settings
-from app.services.inference import get_inference_router
+# [SAGEMAKER] from app.services.inference import get_inference_router  # re-enable for SageMaker
+import app.services.gpu_inference_service as _gpu_svc
 from app.services.storage import get_storage
 
 settings = get_settings()
@@ -161,8 +162,9 @@ def process_tryon_job(self, job_id: str, person_image_path: str, garment_image_p
         output_path = str(
             Path(settings.LOCAL_STORAGE_PATH) / "outputs" / f"{job_id}.jpg"
         )
-        router = get_inference_router()
-        router.run(person_image_path, garment_image_path, output_path)
+        # GPU local inference — models loaded once per worker process
+        _gpu_svc.run(person_image_path, garment_image_path, output_path, job_id=job_id)
+        # [SAGEMAKER] router = get_inference_router(); router.run(...)  # re-enable for SageMaker
 
         # 2. SSIM score
         score = _compute_ssim(person_image_path, output_path)
