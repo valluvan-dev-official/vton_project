@@ -20,11 +20,10 @@ def _make_result_url(request: Request, job: Job) -> str | None:
 
     S3 backend
     ----------
-    result_image_path contains either:
-      - An S3 HTTPS URL  (https://<bucket>.s3.<region>.amazonaws.com/<key>)
-      - An S3 key        (output/<job_id>.jpg)
-    In both cases we return the public HTTPS URL.  If the bucket is private,
-    generate a pre-signed URL instead (see generate_presigned_url in storage.py).
+    Return the /result/{job_id} backend endpoint.  When the frontend calls this
+    endpoint, it:
+      1. Generates a pre-signed URL (works with private S3 buckets)
+      2. Redirects the browser directly to S3 (no API proxy)
 
     Local backend
     -------------
@@ -35,12 +34,8 @@ def _make_result_url(request: Request, job: Job) -> str | None:
         return None
 
     if settings.STORAGE_BACKEND.lower() == "s3":
-        path = job.result_image_path
-        # Already a full HTTPS URL
-        if path.startswith("https://"):
-            return path
-        # S3 key — build the canonical URL
-        return f"https://{settings.S3_BUCKET}.s3.{settings.S3_REGION}.amazonaws.com/{path}"
+        # Return the backend endpoint that will generate a pre-signed S3 URL.
+        return f"{request.base_url}result/{job.id}"
 
     # Local backend — original logic
     path_str = job.result_image_path.replace("\\", "/")
