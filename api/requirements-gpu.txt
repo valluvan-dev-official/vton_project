@@ -14,3 +14,4 @@ git+https://github.com/openai/CLIP.git
 git+https://github.com/facebookresearch/detectron2.git
 # Image and codec support
 av==12.3.0
+pytorch-lightning==1.9.5
