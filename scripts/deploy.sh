@@ -3,14 +3,21 @@
 # deploy.sh — Deploys DCI-VTON.
 # Lives in and runs directly from the Git repository on the EC2 host.
 # Invoked over SSH by .github/workflows/deploy-ec2.yml, which has already
-# `cd`-ed into the project directory before calling this script.
+# `cd`-ed into the project root (PROJECT_DIR) before calling this script.
 #
 # Usage: scripts/deploy.sh [health_url]
 #
+# Layout on the server:
+#   PROJECT_DIR/            <- git root, current working directory on entry
+#   PROJECT_DIR/api/        <- docker-compose.yml, Dockerfile, .env live here
+#   PROJECT_DIR/scripts/    <- this script
+#
 # Contract:
-#   - Assumes the current working directory IS the project directory
-#     (a git checkout containing docker-compose.yml). The caller is
-#     responsible for `cd`-ing there.
+#   - PROJECT_DIR is taken from the current working directory (the caller
+#     already `cd`-ed there) — never hardcoded.
+#   - Git operations (fetch/pull) run in PROJECT_DIR.
+#   - All `docker compose` commands run from PROJECT_DIR/api, where the
+#     compose file actually lives.
 #   - Pulls the latest code on whatever branch is currently checked out
 #     (the workflow only ever triggers on pushes to `ec2`, so that is
 #     always the branch in play).
@@ -36,24 +43,35 @@ fail() { log "FAILED: $1"; exit 1; }
 
 snapshot() {
     log "Resource snapshot: $1"
-    echo "--- df -h ---";          df -h
+    echo "--- df -h ---";            df -h
     echo "--- docker system df ---"; docker system df
-    echo "--- docker ps ---";       docker ps
-    echo "--- docker images ---";   docker images
+    echo "--- docker ps ---";        docker ps
+    echo "--- docker images ---";    docker images
 }
 
 trap 'fail "unexpected error at line $LINENO"' ERR
 
-[[ -f docker-compose.yml || -f compose.yaml ]] || fail "no docker-compose.yml found in $(pwd)"
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "$(pwd) is not a git repository"
+# PROJECT_DIR is wherever the caller cd'ed to before invoking this script.
+PROJECT_DIR="$(pwd)"
+COMPOSE_DIR="$PROJECT_DIR/api"
 
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || fail "$PROJECT_DIR is not a git repository"
+
+if [[ ! -f "$COMPOSE_DIR/docker-compose.yml" && ! -f "$COMPOSE_DIR/compose.yaml" ]]; then
+    fail "docker-compose.yml not found: $COMPOSE_DIR/docker-compose.yml"
+fi
+
+BRANCH="$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD)"
 
 snapshot "before deployment"
 
-log "Step 1/6: Pulling latest code on branch '$BRANCH'"
-git fetch origin
-git pull origin "$BRANCH"
+log "Step 1/6: Pulling latest code on branch '$BRANCH' in $PROJECT_DIR"
+git -C "$PROJECT_DIR" fetch origin
+git -C "$PROJECT_DIR" pull origin "$BRANCH"
+
+cd "$COMPOSE_DIR"
+log "Using compose directory: $COMPOSE_DIR"
 
 log "Step 2/6: Building project images (api, worker, flower only — postgres/redis/base images untouched)"
 if ! $COMPOSE build api worker flower; then
@@ -90,4 +108,4 @@ docker image prune -f
 
 snapshot "after deployment"
 
-log "Deployment summary: branch=$BRANCH health_url=$HEALTH_URL status=SUCCESS"
+log "Deployment summary: branch=$BRANCH compose_dir=$COMPOSE_DIR health_url=$HEALTH_URL status=SUCCESS"
