@@ -73,6 +73,21 @@ git -C "$PROJECT_DIR" pull origin "$BRANCH"
 cd "$COMPOSE_DIR"
 log "Using compose directory: $COMPOSE_DIR"
 
+if [[ ! -e "$PROJECT_DIR/.env" ]]; then
+    if [[ -f "$PROJECT_DIR/api/.env" ]]; then
+        if ln -s "$PROJECT_DIR/api/.env" "$PROJECT_DIR/.env" 2>/dev/null; then
+            log "No .env at $PROJECT_DIR/.env — symlinked it to $PROJECT_DIR/api/.env"
+        else
+            cp "$PROJECT_DIR/api/.env" "$PROJECT_DIR/.env"
+            log "No .env at $PROJECT_DIR/.env — symlink failed, copied it from $PROJECT_DIR/api/.env instead"
+        fi
+    else
+        log "No .env found at $PROJECT_DIR/.env or $PROJECT_DIR/api/.env — continuing without one"
+    fi
+else
+    log ".env already present at $PROJECT_DIR/.env — leaving as is"
+fi
+
 log "Step 2/6: Building project images (api, worker, flower only — postgres/redis/base images untouched)"
 if ! $COMPOSE build api worker flower; then
     fail "docker compose build failed — running containers were NOT stopped or restarted"
