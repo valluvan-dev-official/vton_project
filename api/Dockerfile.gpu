@@ -14,23 +14,32 @@ WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Kolkata
 
+# Acquire::Retries/Timeout mitigate transient mirror connection failures
+# (observed as "Connection failed" / "has no installation candidate" when
+# apt-get update partially fails against a flaky mirror) without masking a
+# genuinely missing package.
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
     echo $TZ > /etc/timezone && \
-    apt-get update && \
+    apt-get update \
+        -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 && \
     apt-get install -y --no-install-recommends \
+        -o Acquire::Retries=5 \
         tzdata \
         libgl1 \
         libglib2.0-0 \
         git \
-        build-essential \
-        libavformat-dev \
-        libavcodec-dev \
-        libavdevice-dev \
-        libavutil-dev \
-        libavfilter-dev \
-        libswscale-dev \
-        libswresample-dev && \
+        build-essential && \
     rm -rf /var/lib/apt/lists/*
+
+# NOTE: the FFmpeg -dev headers (libavformat-dev, libavcodec-dev, etc.)
+# previously listed here were removed. They are only needed if pip has to
+# compile `av` from source; PyAV ships prebuilt manylinux wheels (bundling
+# their own FFmpeg) for this image's Python/arch, so the dev headers were
+# unused build weight. If a future base image / Python version lacks a
+# matching `av` wheel, pip will print "Building wheel for av" in the build
+# log — if that happens, restore these packages before the `av` install.
 
 # Install Python deps (API + GPU inference stack)
 COPY api/requirements.txt     ./requirements.txt

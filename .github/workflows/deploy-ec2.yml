@@ -1,0 +1,90 @@
+name: Deploy to EC2 (ec2 branch)
+
+# Trigger only on pushes to the ec2 branch.
+on:
+  push:
+    branches:
+      - ec2
+
+# Prevent overlapping deployments from stacking up if pushes land close together.
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy on EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ------------------------------------------------------------------
+      # Validate that all required secrets and variables are configured
+      # before attempting SSH, so a missing config fails with a clear
+      # message instead of an opaque connection error.
+      # ------------------------------------------------------------------
+      - name: Validate required secrets and variables
+        run: |
+          missing=0
+          for name in EC2_HOST EC2_USER EC2_SSH_KEY; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing required secret: $name"
+              missing=1
+            fi
+          done
+          for name in EC2_PROJECT_DIR EC2_HEALTH_URL; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing required repository/organization variable: $name"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_PROJECT_DIR: ${{ vars.EC2_PROJECT_DIR }}
+          EC2_HEALTH_URL: ${{ vars.EC2_HEALTH_URL }}
+
+      # ------------------------------------------------------------------
+      # Create the temporary SSH private key from the EC2_SSH_KEY secret
+      # and lock it down to chmod 600, then trust the EC2 host key via
+      # ssh-keyscan (host key is verified — no StrictHostKeyChecking=no).
+      # ------------------------------------------------------------------
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # ------------------------------------------------------------------
+      # SSH into the EC2 instance, move into the project directory (the
+      # existing Git checkout — no scp, no /tmp copy), and run the
+      # deployment script that already lives in that repository. SSH
+      # streams stdout/stderr straight into the Actions log, and
+      # propagates deploy.sh's exit code, so any failure fails this step
+      # (and the job) immediately.
+      # ------------------------------------------------------------------
+      - name: Run deployment script on EC2
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" \
+            "set -e; cd '${{ vars.EC2_PROJECT_DIR }}' && chmod +x scripts/deploy.sh && bash scripts/deploy.sh '${{ vars.EC2_HEALTH_URL }}'"
+
+      # ------------------------------------------------------------------
+      # Always remove the temporary SSH key from the runner, whether the
+      # deployment succeeded or failed.
+      # ------------------------------------------------------------------
+      - name: Remove temporary SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+      - name: Deployment summary
+        if: success()
+        run: echo "✅ Deployment to ${{ secrets.EC2_HOST }} completed successfully."
+
+      - name: Failure notice
+        if: failure()
+        run: echo "❌ Deployment failed. See the 'Run deployment script on EC2' step output above for details from deploy.sh."

@@ -35,7 +35,7 @@ def _make_result_url(request: Request, job: Job) -> str | None:
 
     if settings.STORAGE_BACKEND.lower() == "s3":
         # Return the backend endpoint that will generate a pre-signed S3 URL.
-        return f"{request.base_url}result/{job.id}"
+        return str(request.url_for("get_result", job_id=job.id))
 
     # Local backend — original logic
     path_str = job.result_image_path.replace("\\", "/")
@@ -56,7 +56,7 @@ async def get_status(job_id: str, request: Request, db: AsyncSession = Depends(g
     return job.to_dict(result_url=_make_result_url(request, job))
 
 
-@router.get("/result/{job_id}", summary="Download result image (binary)")
+@router.get("/result/{job_id}", summary="Download result image (binary)", name="get_result")
 async def get_result(job_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Job).where(Job.id == job_id))
     job = result.scalar_one_or_none()

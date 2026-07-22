@@ -1,0 +1,34 @@
+# Build context for api/Dockerfile.gpu is the project root (context: ..).
+# Without this file, `docker compose build` sends the entire repo —
+# .git history, sample/result images, docs — to the Docker daemon on
+# every build, which slows builds and needlessly increases the chance of
+# a build being interrupted by a slow/flaky transfer. None of this is
+# referenced by `COPY api/ .`, so it is safe to exclude.
+
+.git
+.github
+.claude
+
+# Model weights are volume-mounted at runtime (../ml:/app/ml), never
+# copied into the image — excluding them keeps large checkpoint files
+# out of the build context entirely.
+ml/checkpoints/
+ml/data/
+*.pt
+*.pth
+*.safetensors
+
+# Sample/result images and docs at the repo root — not used by the image.
+*.jpg
+*.jpeg
+*.png
+*.pdf
+
+# Runtime/dev artifacts never needed inside the image.
+storage/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
