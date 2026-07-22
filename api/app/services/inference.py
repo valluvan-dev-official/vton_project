@@ -13,7 +13,7 @@ This replaces the previous Kaggle-notebook backend. No Kaggle dependency remains
 import logging
 import time
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +66,29 @@ class InferenceRouter:
             except Exception as exc:
                 logger.warning(f"Own model load failed: {exc}. Falling back.")
 
+    # ── Preprocessing ──────────────────────────────────────────────────────────
+
+    def _preprocess_garment(self, garment_path: str) -> str:
+        """Remove garment background → white bg. Falls back to original on failure."""
+        try:
+            from rembg import remove as rembg_remove
+            img = Image.open(garment_path).convert("RGBA")
+            result = rembg_remove(img)
+            white_bg = Image.new("RGBA", result.size, (255, 255, 255, 255))
+            white_bg.paste(result, mask=result.split()[3])
+            out = white_bg.convert("RGB")
+            clean_path = str(Path(garment_path).with_suffix("")) + "_clean.jpg"
+            out.save(clean_path, "JPEG", quality=95)
+            logger.info(f"[Preprocess] Garment bg removed → {clean_path}")
+            return clean_path
+        except Exception as exc:
+            logger.warning(f"[Preprocess] rembg failed ({exc}), using original garment.")
+            return garment_path
+
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def run(self, person_image_path: str, garment_image_path: str, output_path: str) -> str:
+        garment_image_path = self._preprocess_garment(garment_image_path)
         if self.use_own_model and self._model:
             return self._run_own_model(person_image_path, garment_image_path, output_path)
         if self._mode == "sagemaker":

@@ -17,6 +17,7 @@ pillow==10.3.0
 scikit-image==0.23.2
 numpy==1.26.4
 opencv-python-headless==4.9.0.80
+rembg==2.0.57
 
 # API
 python-multipart==0.0.9
