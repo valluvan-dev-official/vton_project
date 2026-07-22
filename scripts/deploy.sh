@@ -9,15 +9,17 @@
 #
 # Layout on the server:
 #   PROJECT_DIR/            <- git root, current working directory on entry
-#   PROJECT_DIR/api/        <- docker-compose.yml, Dockerfile, .env live here
+#   PROJECT_DIR/api/        <- docker-compose.gpu.yml, Dockerfile.gpu, .env live here
 #   PROJECT_DIR/scripts/    <- this script
 #
 # Contract:
 #   - PROJECT_DIR is taken from the current working directory (the caller
 #     already `cd`-ed there) — never hardcoded.
 #   - Git operations (fetch/pull) run in PROJECT_DIR.
-#   - All `docker compose` commands run from PROJECT_DIR/api, where the
-#     compose file actually lives.
+#   - All `docker compose` commands run from PROJECT_DIR/api using
+#     -f docker-compose.gpu.yml explicitly, which builds api/Dockerfile.gpu
+#     (PyTorch + CUDA base image, requirements.txt + requirements-gpu.txt).
+#     The CPU-only docker-compose.yml / Dockerfile are never referenced.
 #   - Pulls the latest code on whatever branch is currently checked out
 #     (the workflow only ever triggers on pushes to `ec2`, so that is
 #     always the branch in play).
@@ -34,7 +36,13 @@ set -Eeuo pipefail
 
 HEALTH_URL="${1:-http://localhost:8000/health}"
 FALLBACK_HEALTH_URL="http://localhost:8000/docs"
-COMPOSE="docker compose"
+# Production always builds/runs the GPU stack (api/docker-compose.gpu.yml,
+# which builds api/Dockerfile.gpu). The plain "docker compose" invocation
+# would silently fall back to api/docker-compose.yml (CPU image, no
+# torch) since that's Compose's default file when no -f is given — so
+# the GPU file must always be named explicitly.
+COMPOSE_FILE="docker-compose.gpu.yml"
+COMPOSE="docker compose -f $COMPOSE_FILE"
 HEALTH_RETRIES=10
 HEALTH_RETRY_DELAY=6
 
@@ -58,8 +66,8 @@ COMPOSE_DIR="$PROJECT_DIR/api"
 git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || fail "$PROJECT_DIR is not a git repository"
 
-if [[ ! -f "$COMPOSE_DIR/docker-compose.yml" && ! -f "$COMPOSE_DIR/compose.yaml" ]]; then
-    fail "docker-compose.yml not found: $COMPOSE_DIR/docker-compose.yml"
+if [[ ! -f "$COMPOSE_DIR/$COMPOSE_FILE" ]]; then
+    fail "GPU compose file not found: $COMPOSE_DIR/$COMPOSE_FILE"
 fi
 
 BRANCH="$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD)"
@@ -71,7 +79,7 @@ git -C "$PROJECT_DIR" fetch origin
 git -C "$PROJECT_DIR" pull origin "$BRANCH"
 
 cd "$COMPOSE_DIR"
-log "Using compose directory: $COMPOSE_DIR"
+log "Using compose directory: $COMPOSE_DIR (file: $COMPOSE_FILE)"
 
 if [[ ! -e "$PROJECT_DIR/.env" ]]; then
     if [[ -f "$PROJECT_DIR/api/.env" ]]; then
@@ -123,4 +131,4 @@ docker image prune -f
 
 snapshot "after deployment"
 
-log "Deployment summary: branch=$BRANCH compose_dir=$COMPOSE_DIR health_url=$HEALTH_URL status=SUCCESS"
+log "Deployment summary: branch=$BRANCH compose_dir=$COMPOSE_DIR compose_file=$COMPOSE_FILE health_url=$HEALTH_URL status=SUCCESS"
