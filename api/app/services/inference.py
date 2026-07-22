@@ -188,10 +188,33 @@ class InferenceRouter:
 
     # ── Phase 2: Kaggle DCI-VTON ───────────────────────────────────────────────
 
+    def _preprocess_garment(self, garment_path: str) -> str:
+        """Remove garment background and return path to white-bg version.
+        Falls back to original path if rembg is unavailable or fails.
+        """
+        try:
+            from rembg import remove as rembg_remove
+            img = Image.open(garment_path).convert("RGBA")
+            result = rembg_remove(img)
+            # Composite onto white background
+            white_bg = Image.new("RGBA", result.size, (255, 255, 255, 255))
+            white_bg.paste(result, mask=result.split()[3])
+            out = white_bg.convert("RGB")
+            clean_path = garment_path.replace(Path(garment_path).suffix, "_clean.jpg")
+            out.save(clean_path, "JPEG", quality=95)
+            logger.info(f"[Preprocess] Garment background removed → {clean_path}")
+            return clean_path
+        except Exception as exc:
+            logger.warning(f"[Preprocess] rembg failed ({exc}), using original garment.")
+            return garment_path
+
     def _run_kaggle(self, person_path: str, garment_path: str, output_path: str) -> str:
         _sync_kaggle_oauth_token()
         job_id = Path(output_path).stem
         logger.info(f"[Kaggle] Starting inference for job {job_id}")
+
+        # Preprocess garment — remove background before sending to Kaggle
+        garment_path = self._preprocess_garment(garment_path)
 
         max_gpu_retries = 8
         for attempt in range(1, max_gpu_retries + 1):
