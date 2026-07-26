@@ -265,6 +265,11 @@ class GPUInferenceEngine:
         else:
             g_neckline_y, g_neck_width = 100, 120
 
+        # Face bottom boundary — used to fully cover person's collar regardless of garment type
+        face_mask = (pred == 11)
+        face_ys = np.where(face_mask.any(axis=1))[0]
+        face_bottom_y = int(face_ys.max()) if len(face_ys) > 0 else None
+
         shirt_ys = np.where(shirt_base_mask.any(axis=1))[0]
         if len(shirt_ys) > 0:
             shirt_top_y = int(shirt_ys.min())
@@ -273,9 +278,10 @@ class GPUInferenceEngine:
             half_w = max(80, g_neck_width // 2 + 30)
             strip_x1 = max(0, person_center_x - half_w)
             strip_x2 = min(SIZE, person_center_x + half_w)
-            collar_erase_up = max(50, int(g_neckline_y * 0.5))
+            # Use face bottom as collar strip start — covers full collar area for any garment type
+            collar_top = face_bottom_y if face_bottom_y is not None else max(0, shirt_top_y - max(50, int(g_neckline_y * 0.5)))
             collar_strip = np.zeros((SIZE, SIZE), dtype=np.uint8)
-            collar_strip[max(0, shirt_top_y - collar_erase_up):min(SIZE, shirt_top_y + 30), strip_x1:strip_x2] = 1
+            collar_strip[collar_top:min(SIZE, shirt_top_y + 30), strip_x1:strip_x2] = 1
         else:
             collar_strip = np.zeros((SIZE, SIZE), dtype=np.uint8)
 
@@ -389,7 +395,14 @@ class GPUInferenceEngine:
 
             ref_L = garment_lab[:, :, 0][garment_fg_mask].mean()
             res_L = result_lab[:, :, 0][shirt_mask].mean()
-            dL = (ref_L - res_L) * 0.35
+            # Adaptive shift — dark garments need stronger correction
+            if ref_L < 40:
+                dL_factor = 0.75
+            elif ref_L < 80:
+                dL_factor = 0.50
+            else:
+                dL_factor = 0.35
+            dL = (ref_L - res_L) * dL_factor
             corrected_lab[:, :, 0][shirt_mask] = np.clip(result_lab[:, :, 0][shirt_mask] + dL, 0, 255)
 
             corrected_lab[:, :, 1][shirt_mask] = match_histograms(
