@@ -249,14 +249,19 @@ class GPUInferenceEngine:
         pred = self._segment(person_pil)
         g_pred = self._segment(garment_pil)
 
+        # Garment clean — gray fill background, then crop top 8% to remove hanger/hook
         garment_clean_np = garment_np.copy()
         garment_clean_np[g_pred == 0] = [128, 128, 128]
+        hanger_crop_y = int(SIZE * 0.08)
+        garment_clean_np[:hanger_crop_y, :] = [128, 128, 128]
+        g_pred_cropped = g_pred.copy()
+        g_pred_cropped[:hanger_crop_y, :] = 0
         garment_clean_pil = Image.fromarray(garment_clean_np)
 
         upper_labels = [4, 5, 7]
         shirt_base_mask = np.isin(pred, upper_labels).astype(np.uint8)
 
-        garment_fg = (g_pred != 0)
+        garment_fg = (g_pred_cropped != 0)
         garment_fg_ys = np.where(garment_fg.any(axis=1))[0]
         if len(garment_fg_ys) > 0:
             g_neckline_y = int(garment_fg_ys.min())
@@ -265,7 +270,7 @@ class GPUInferenceEngine:
         else:
             g_neckline_y, g_neck_width = 100, 120
 
-        # Face bottom boundary — used to fully cover person's collar regardless of garment type
+        # Face bottom boundary — collar strip spans full width to cover formal shirt collar completely
         face_mask = (pred == 11)
         face_ys = np.where(face_mask.any(axis=1))[0]
         face_bottom_y = int(face_ys.max()) if len(face_ys) > 0 else None
@@ -273,15 +278,10 @@ class GPUInferenceEngine:
         shirt_ys = np.where(shirt_base_mask.any(axis=1))[0]
         if len(shirt_ys) > 0:
             shirt_top_y = int(shirt_ys.min())
-            shirt_cols = np.where(shirt_base_mask.any(axis=0))[0]
-            person_center_x = int(shirt_cols.mean()) if len(shirt_cols) > 0 else SIZE // 2
-            half_w = max(80, g_neck_width // 2 + 30)
-            strip_x1 = max(0, person_center_x - half_w)
-            strip_x2 = min(SIZE, person_center_x + half_w)
-            # Use face bottom as collar strip start — covers full collar area for any garment type
             collar_top = face_bottom_y if face_bottom_y is not None else max(0, shirt_top_y - max(50, int(g_neckline_y * 0.5)))
             collar_strip = np.zeros((SIZE, SIZE), dtype=np.uint8)
-            collar_strip[collar_top:min(SIZE, shirt_top_y + 30), strip_x1:strip_x2] = 1
+            # Full width — covers collar for any shirt type (formal, casual, collar, collarless)
+            collar_strip[collar_top:min(SIZE, shirt_top_y + 30), :] = 1
         else:
             collar_strip = np.zeros((SIZE, SIZE), dtype=np.uint8)
 
