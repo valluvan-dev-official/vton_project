@@ -1,6 +1,6 @@
 # ── IDM-VTON GPU inference dependencies ──────────────────────────────────────
 # Diffusion pipeline
-diffusers==0.27.2
+diffusers==0.25.1
 accelerate==0.28.0
 huggingface_hub==0.23.4
 
