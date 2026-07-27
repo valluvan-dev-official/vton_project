@@ -180,7 +180,7 @@ class GPUInferenceEngine:
         import torchvision.transforms as T
         tensor_tf = T.Compose([
             T.ToTensor(),
-            T.Normalize([0.5], [0.5]),
+            T.Normalize([0.5]*3, [0.5]*3),
         ])
 
         mask_gray_t = (1 - T.ToTensor()(mask)) * tensor_tf(person_pil.resize((SIZE_W, SIZE_H)))
@@ -246,15 +246,15 @@ class GPUInferenceEngine:
 
         with torch.inference_mode():
             images = self._pipe(
-                prompt_embeds=prompt_embeds.to(torch.float16),
-                negative_prompt_embeds=negative_prompt_embeds.to(torch.float16),
-                pooled_prompt_embeds=pooled_prompt_embeds.to(torch.float16),
-                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(torch.float16),
+                prompt_embeds=prompt_embeds.to(self.device, torch.float16),
+                negative_prompt_embeds=negative_prompt_embeds.to(self.device, torch.float16),
+                pooled_prompt_embeds=pooled_prompt_embeds.to(self.device, torch.float16),
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(self.device, torch.float16),
                 num_inference_steps=30,
                 generator=generator,
                 strength=1.0,
                 pose_img=pose_tensor,
-                text_embeds_cloth=prompt_embeds_cloth.to(torch.float16),
+                text_embeds_cloth=prompt_embeds_cloth.to(self.device, torch.float16),
                 cloth=garment_tensor,
                 mask_image=mask_pil,
                 image=person_pil,
