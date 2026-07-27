@@ -65,7 +65,10 @@ class GPUInferenceEngine:
         # Link ckpt/ from extracted weights into the cloned repo so humanparsing/openpose find them
         ckpt_src = self.idm_path / "ckpt"
         ckpt_dst = self.idm_repo / "ckpt"
-        if ckpt_src.exists() and not ckpt_dst.exists():
+        if ckpt_src.exists() and not ckpt_dst.is_symlink():
+            if ckpt_dst.exists():
+                import shutil
+                shutil.rmtree(str(ckpt_dst))
             ckpt_dst.symlink_to(ckpt_src.resolve())
             logger.info("Linked ckpt/ from weights into IDM-VTON repo.")
 
