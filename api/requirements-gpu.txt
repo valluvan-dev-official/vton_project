@@ -3,6 +3,7 @@
 diffusers==0.25.1
 accelerate==0.28.0
 huggingface_hub==0.23.4
+numpy<2
 
 # Transformers + vision
 transformers==4.46.3
