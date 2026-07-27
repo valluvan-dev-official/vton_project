@@ -145,6 +145,16 @@ class GPUInferenceEngine:
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
 
+    def _render_pose_image(self, keypoints_dict: dict, width: int, height: int) -> Image.Image:
+        """Render OpenPose keypoints dict → PIL RGB image."""
+        from preprocess.openpose.util import draw_bodypose
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        candidate = keypoints_dict.get("candidate", [])
+        subset    = keypoints_dict.get("subset", [])
+        if len(candidate) > 0 and len(subset) > 0:
+            canvas = draw_bodypose(canvas, candidate, subset)
+        return Image.fromarray(canvas)
+
     def _get_agnostic_mask(self, person_pil: Image.Image):
         """Parse person → agnostic image + binary mask using SCHP + get_mask_location."""
         parse_result, _ = self._parser(person_pil.resize((PARSE_W, PARSE_H)))
@@ -187,7 +197,8 @@ class GPUInferenceEngine:
         person_pil = person_pil.resize((SIZE_W, SIZE_H))
 
         # ── Step 2: Prepare tensors ──
-        pose_tensor    = tensor_tf(keypoints.resize((SIZE_W, SIZE_H))).unsqueeze(0).to(self.device, torch.float16)
+        pose_img       = self._render_pose_image(keypoints, SIZE_W, SIZE_H)
+        pose_tensor    = tensor_tf(pose_img).unsqueeze(0).to(self.device, torch.float16)
         garment_tensor = tensor_tf(garment_pil).unsqueeze(0).to(self.device, torch.float16)
 
         # ── Step 3: Encode prompts ──
