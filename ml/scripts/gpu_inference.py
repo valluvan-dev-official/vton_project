@@ -261,7 +261,7 @@ class GPUInferenceEngine:
                 height=SIZE_H,
                 width=SIZE_W,
                 ip_adapter_image=garment_pil,
-                guidance_scale=2.0,
+                guidance_scale=2.5,
             )[0]
 
         # ── Step 5: Save result ──
