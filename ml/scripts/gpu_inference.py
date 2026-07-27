@@ -62,6 +62,13 @@ class GPUInferenceEngine:
             ], check=True)
             logger.info("IDM-VTON repo cloned.")
 
+        # Link ckpt/ from extracted weights into the cloned repo so humanparsing/openpose find them
+        ckpt_src = self.idm_path / "ckpt"
+        ckpt_dst = self.idm_repo / "ckpt"
+        if ckpt_src.exists() and not ckpt_dst.exists():
+            ckpt_dst.symlink_to(ckpt_src.resolve())
+            logger.info("Linked ckpt/ from weights into IDM-VTON repo.")
+
         # Prepend so IDM-VTON's src/ and preprocess/ are importable
         for sub in ["", "src", "preprocess"]:
             p = str(self.idm_repo / sub) if sub else str(self.idm_repo)
