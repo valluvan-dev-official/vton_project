@@ -86,10 +86,12 @@ class GPUInferenceEngine:
         _spec.loader.exec_module(_mod)
         self._get_mask_location = _mod.get_mask_location
 
-        _spec2 = _ilu.spec_from_file_location("openpose_util", str(self.idm_repo / "preprocess" / "openpose" / "annotator" / "openpose" / "body.py"))
-        _mod2 = _ilu.module_from_spec(_spec2)
-        _spec2.loader.exec_module(_mod2)
-        self._draw_bodypose = _mod2.draw_bodypose
+        # annotator/openpose/ has __init__.py so relative imports work when loaded as a package
+        annotator_dir = str(self.idm_repo / "preprocess" / "openpose" / "annotator")
+        if annotator_dir not in sys.path:
+            sys.path.insert(0, annotator_dir)
+        from openpose.body import draw_bodypose
+        self._draw_bodypose = draw_bodypose
 
     # ── Model loading ─────────────────────────────────────────────────────────
 
