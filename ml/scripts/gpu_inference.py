@@ -1,19 +1,21 @@
 """
-DCI-VTON GPU Inference Script — runs locally on GPU (no Kaggle dependency).
+IDM-VTON GPU Inference Engine
+
+Pipeline:
+  1. Human Parser (SCHP)  → agnostic person image + mask
+  2. OpenPose             → body keypoints
+  3. IDM-VTON             → SDXL + IP-Adapter garment try-on
 
 Usage:
-    python gpu_inference.py --person /path/to/person.jpg --garment /path/to/garment.jpg --output /path/to/result.jpg --job-id abc123
-
-Or import and use the GPUInferenceEngine class directly.
+    engine = GPUInferenceEngine(weights_dir="/app/ml/weights", device="cuda")
+    engine.run(person_path, garment_path, output_path, job_id)
 """
 import sys
 import os
-import json
 import hashlib
-import shutil
 import subprocess
-import argparse
 import logging
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -23,447 +25,222 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-SIZE = 512
+SIZE_W, SIZE_H = 768, 1024
+PARSE_W, PARSE_H = 384, 512
 
 
 class GPUInferenceEngine:
-    """Preloads all models once, then runs inference per-job in ~20-30s."""
+    """Preloads all IDM-VTON models once, then runs inference per-job."""
 
-    def __init__(self, weights_dir: str, device: str = "cuda", workspace: str = "/tmp/vton_workspace"):
-        self.device = torch.device(device)
+    def __init__(self, weights_dir: str, device: str = "cuda",
+                 workspace: str = "/tmp/vton_workspace"):
+        self.device      = torch.device(device)
         self.weights_dir = Path(weights_dir)
-        self.workspace = Path(workspace)
+        self.idm_path    = self.weights_dir / "idm_vton"
+        self.workspace   = Path(workspace)
         self.workspace.mkdir(parents=True, exist_ok=True)
 
         self._ensure_repos()
-        self._load_segformer()
-        self._load_densepose()
-        self._load_afwm()
-        self._load_dci_model()
-        logger.info("GPUInferenceEngine: all models loaded.")
+        self._load_human_parser()
+        self._load_openpose()
+        self._load_idm_pipeline()
+        logger.info("GPUInferenceEngine (IDM-VTON): all models loaded.")
+
+    # ── Repo bootstrap ────────────────────────────────────────────────────────
 
     def _ensure_repos(self):
         repo_dir = self.workspace / "repos"
         repo_dir.mkdir(exist_ok=True)
 
-        self.dci_repo = repo_dir / "DCI-VTON-Virtual-Try-On"
-        if not self.dci_repo.exists():
-            subprocess.run(["git", "clone", "--depth=1",
-                "https://github.com/bcmi/DCI-VTON-Virtual-Try-On.git",
-                str(self.dci_repo)], check=True)
+        self.idm_repo = repo_dir / "IDM-VTON"
+        if not self.idm_repo.exists():
+            logger.info("Cloning IDM-VTON repo...")
+            subprocess.run([
+                "git", "clone", "--depth=1",
+                "https://github.com/yisol/IDM-VTON.git",
+                str(self.idm_repo),
+            ], check=True)
+            logger.info("IDM-VTON repo cloned.")
 
-        self.taming_repo = repo_dir / "taming-transformers"
-        if not self.taming_repo.exists():
-            subprocess.run(["git", "clone", "--depth=1",
-                "https://github.com/CompVis/taming-transformers.git",
-                str(self.taming_repo)], check=True)
+        # Prepend so IDM-VTON's src/ and preprocess/ are importable
+        for sub in ["", "src", "preprocess"]:
+            p = str(self.idm_repo / sub) if sub else str(self.idm_repo)
+            if p not in sys.path:
+                sys.path.insert(0, p)
 
-        self.pfafn_repo = repo_dir / "PF-AFN"
-        if not self.pfafn_repo.exists():
-            subprocess.run(["git", "clone", "--depth=1",
-                "https://github.com/geyuying/PF-AFN.git",
-                str(self.pfafn_repo)], check=True)
+    # ── Model loading ─────────────────────────────────────────────────────────
 
-        sys.path.insert(0, str(self.dci_repo))
-        sys.path.insert(0, str(self.taming_repo))
+    def _load_human_parser(self):
+        from humanparsing.run_parsing import Parsing
+        gpu_id = 0 if self.device.type == "cuda" else -1
+        self._parser = Parsing(gpu_id)
+        logger.info("Human parser (SCHP) loaded.")
 
-        # Setup PF-AFN correlation module
-        pfafn_test = self.pfafn_repo / "PF-AFN_test"
-        (pfafn_test / "models" / "__init__.py").touch()
-        corr_dir = pfafn_test / "models" / "correlation"
-        corr_dir.mkdir(parents=True, exist_ok=True)
-        (corr_dir / "__init__.py").touch()
-        (corr_dir / "correlation.py").write_text(CORRELATION_CODE)
-        sys.path.insert(0, str(pfafn_test))
+    def _load_openpose(self):
+        from openpose.run_openpose import OpenPose
+        gpu_id = 0 if self.device.type == "cuda" else -1
+        self._openpose = OpenPose(gpu_id)
+        logger.info("OpenPose loaded.")
 
-    def _load_segformer(self):
-        from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
-        import torch.nn.functional as F
-        self._seg_processor = SegformerImageProcessor.from_pretrained("mattmdjaga/segformer_b2_clothes")
-        self._seg_model = SegformerForSemanticSegmentation.from_pretrained("mattmdjaga/segformer_b2_clothes")
-        self._seg_model.eval()
-        logger.info("SegFormer loaded.")
+    def _load_idm_pipeline(self):
+        from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
+        from src.unet_hacked_garmnet import UNet2DConditionModel as GarmentUNet
+        from src.unet_hacked_tryon import UNet2DConditionModel as TryonUNet
+        from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+        from diffusers import AutoencoderKL
 
-    def _segment(self, pil_img):
-        import torch.nn.functional as F
-        inputs = self._seg_processor(images=pil_img, return_tensors="pt")
-        with torch.no_grad():
-            logits = self._seg_model(**inputs).logits
-        up = F.interpolate(logits, size=(SIZE, SIZE), mode="bilinear", align_corners=False)
-        return up.argmax(dim=1).squeeze().numpy()
+        base = str(self.idm_path)
 
-    def _load_densepose(self):
-        dp_repo = self.workspace / "repos" / "detectron2_repo"
-        if not dp_repo.exists():
-            subprocess.run(["git", "clone", "--depth=1",
-                "https://github.com/facebookresearch/detectron2.git",
-                str(dp_repo)], check=True)
+        unet = TryonUNet.from_pretrained(
+            base, subfolder="unet", torch_dtype=torch.float16
+        )
+        unet.requires_grad_(False)
 
-        sys.path.insert(0, str(dp_repo / "projects" / "DensePose"))
+        unet_encoder = GarmentUNet.from_pretrained(
+            base, subfolder="unet_encoder", torch_dtype=torch.float16
+        )
+        unet_encoder.requires_grad_(False)
 
-        for k in list(sys.modules.keys()):
-            if "detectron2" in k or "densepose" in k:
-                del sys.modules[k]
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            base, subfolder="image_encoder", torch_dtype=torch.float16
+        )
+        image_encoder.requires_grad_(False)
 
-        from detectron2.config import get_cfg
-        from detectron2.engine import DefaultPredictor
-        from densepose import add_densepose_config
+        vae = AutoencoderKL.from_pretrained(
+            base, subfolder="vae", torch_dtype=torch.float16
+        )
 
-        dp_weights = self.weights_dir / "densepose_rcnn_R_50_FPN_s1x.pkl"
-        if not dp_weights.exists():
-            import urllib.request
-            url = "https://dl.fbaipublicfiles.com/densepose/densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl"
-            logger.info("Downloading DensePose weights...")
-            urllib.request.urlretrieve(url, str(dp_weights))
+        self._pipe = TryonPipeline.from_pretrained(
+            base,
+            unet=unet,
+            vae=vae,
+            feature_extractor=CLIPImageProcessor(),
+            image_encoder=image_encoder,
+            UNet_Encoder=unet_encoder,
+            torch_dtype=torch.float16,
+            add_watermarker=False,
+            safety_checker=None,
+        )
+        # enable_model_cpu_offload handles 16GB GPU efficiently
+        self._pipe.enable_model_cpu_offload()
+        self._pipe.unet_encoder = unet_encoder
+        logger.info("IDM-VTON pipeline loaded.")
 
-        cfg = get_cfg()
-        add_densepose_config(cfg)
-        cfg.merge_from_file(str(dp_repo / "projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml"))
-        cfg.MODEL.WEIGHTS = str(dp_weights)
-        cfg.MODEL.DEVICE = str(self.device)
-        cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.7
-        cfg.freeze()
-        self._dp_predictor = DefaultPredictor(cfg)
-        logger.info("DensePose loaded.")
+    # ── Preprocessing ─────────────────────────────────────────────────────────
 
-    def _get_densepose_iuv(self, person_np_img):
-        outputs = self._dp_predictor(person_np_img[:, :, ::-1])
-        instances = outputs["instances"]
-        iuv_full = np.zeros((SIZE, SIZE, 3), dtype=np.float32)
-        if len(instances) == 0:
-            return iuv_full
-        best = instances.scores.cpu().numpy().argmax()
-        result = instances.pred_densepose[best]
-        bbox = instances.pred_boxes.tensor.cpu().numpy()[best]
-        fine_segm = result.fine_segm.cpu()
-        u_map = result.u.cpu()
-        v_map = result.v.cpu()
-        part_idx_t = fine_segm.argmax(dim=0)
-        idx_exp = part_idx_t.unsqueeze(0)
-        u_vals = u_map.gather(0, idx_exp).squeeze(0).numpy()
-        v_vals = v_map.gather(0, idx_exp).squeeze(0).numpy()
-        part_idx = part_idx_t.numpy().astype(np.float32)
-        x1, y1, x2, y2 = map(int, bbox)
-        bh, bw = max(1, y2-y1), max(1, x2-x1)
-        I_r = cv2.resize(part_idx, (bw, bh))
-        U_r = cv2.resize(u_vals, (bw, bh))
-        V_r = cv2.resize(v_vals, (bw, bh))
-        I_f = np.zeros((SIZE, SIZE), dtype=np.float32)
-        U_f = np.zeros((SIZE, SIZE), dtype=np.float32)
-        V_f = np.zeros((SIZE, SIZE), dtype=np.float32)
-        y1c, y2c = max(0, y1), min(SIZE, y2)
-        x1c, x2c = max(0, x1), min(SIZE, x2)
-        dh, dw = y2c-y1c, x2c-x1c
-        I_f[y1c:y2c, x1c:x2c] = I_r[:dh, :dw] / 112.0
-        U_f[y1c:y2c, x1c:x2c] = U_r[:dh, :dw]
-        V_f[y1c:y2c, x1c:x2c] = V_r[:dh, :dw]
-        return np.stack([I_f, U_f, V_f], axis=-1)
+    def _get_agnostic_mask(self, person_pil: Image.Image):
+        """Parse person → agnostic image + binary mask using SCHP + get_mask_location."""
+        from utils_mask import get_mask_location
 
-    def _load_afwm(self):
-        from models.afwm import AFWM
-        from models.networks import load_checkpoint
+        parse_result, _ = self._parser(person_pil.resize((PARSE_W, PARSE_H)))
+        keypoints = self._openpose(person_pil.resize((PARSE_W, PARSE_H)))
 
-        class WarpOpt:
-            label_nc = 13
-            gpu_ids = [0]
-            batchSize = 1
-            fineSize = 512
-            isTrain = False
+        mask, mask_gray = get_mask_location("hd", "upper_body", parse_result, keypoints)
+        mask = mask.resize((SIZE_W, SIZE_H))
 
-        self._warp_model = AFWM(WarpOpt(), 3 + WarpOpt.label_nc)
-        warp_pth = self.weights_dir / "warp_viton.pth"
-        load_checkpoint(self._warp_model, str(warp_pth))
-        self._warp_model.eval().to(self.device)
-        logger.info("AFWM warp loaded.")
+        import torchvision.transforms as T
+        tensor_tf = T.Compose([
+            T.ToTensor(),
+            T.Normalize([0.5], [0.5]),
+        ])
 
-    def _load_dci_model(self):
-        import collections
-        import torchvision.models as tv_models
-        from omegaconf import OmegaConf
+        mask_gray_t = (1 - T.ToTensor()(mask)) * tensor_tf(person_pil.resize((SIZE_W, SIZE_H)))
+        from torchvision.transforms.functional import to_pil_image
+        mask_gray_img = to_pil_image((mask_gray_t + 1.0) / 2.0)
 
-        # VGG weights
-        vgg_dir = self.workspace / "models" / "vgg"
-        vgg_dir.mkdir(parents=True, exist_ok=True)
-        vgg_pth = vgg_dir / "vgg19_conv.pth"
-        if not vgg_pth.exists():
-            idx_to_name = {
-                0:'conv1_1', 2:'conv1_2', 5:'conv2_1', 7:'conv2_2',
-                10:'conv3_1', 12:'conv3_2', 14:'conv3_3', 16:'conv3_4',
-                19:'conv4_1', 21:'conv4_2', 23:'conv4_3', 25:'conv4_4',
-                28:'conv5_1', 30:'conv5_2', 32:'conv5_3', 34:'conv5_4',
-            }
-            vgg19 = tv_models.vgg19(weights=tv_models.VGG19_Weights.DEFAULT)
-            sd = collections.OrderedDict()
-            for idx, name in idx_to_name.items():
-                layer = vgg19.features[idx]
-                sd[f"{name}.weight"] = layer.weight.data.clone()
-                sd[f"{name}.bias"] = layer.bias.data.clone()
-            torch.save(sd, str(vgg_pth))
+        agnostic = person_pil.resize((SIZE_W, SIZE_H)).copy()
+        agnostic.paste(mask_gray_img, None, Image.fromarray(np.uint8(mask)))
 
-        os.chdir(str(self.workspace))
+        return agnostic, mask, keypoints
 
-        # CLIP patch
-        from transformers import CLIPVisionModel as _CLIP
-        _orig_fp = _CLIP.from_pretrained.__func__
-        @classmethod
-        def _patched_fp(cls, *args, **kwargs):
-            kwargs.setdefault("attn_implementation", "eager")
-            return _orig_fp(cls, *args, **kwargs)
-        _CLIP.from_pretrained = _patched_fp
-        import ldm.modules.encoders.modules as _enc_mod
-        _enc_mod.CLIPVisionModel = _CLIP
+    # ── Inference ─────────────────────────────────────────────────────────────
 
-        from ldm.util import instantiate_from_config
-        from ldm.models.diffusion.ddim import DDIMSampler
-
-        config_path = str(self.dci_repo / "configs" / "viton512.yaml")
-        ckpt_path = str(self.weights_dir / "viton512.ckpt")
-
-        config = OmegaConf.load(config_path)
-        pl_sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        self._dci_model = instantiate_from_config(config.model)
-        self._dci_model.load_state_dict(pl_sd["state_dict"], strict=False)
-        self._dci_model = self._dci_model.to(self.device).eval()
-        self._sampler = DDIMSampler(self._dci_model)
-        logger.info("DCI-VTON model loaded.")
-
-    def run(self, person_path: str, garment_path: str, output_path: str, job_id: str = ""):
-        import torchvision
-        from torchvision.transforms import Resize
-        from skimage.exposure import match_histograms
+    def run(self, person_path: str, garment_path: str,
+            output_path: str, job_id: str = "") -> str:
+        import torchvision.transforms as T
 
         if not job_id:
             job_id = Path(output_path).stem
 
-        device = self.device
-        model = self._dci_model
-        sampler = self._sampler
+        tensor_tf = T.Compose([T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
 
-        # Load images
-        person_pil = Image.open(person_path).convert("RGB").resize((SIZE, SIZE))
-        garment_pil = Image.open(garment_path).convert("RGB").resize((SIZE, SIZE))
-        person_np = np.array(person_pil)
-        garment_np = np.array(garment_pil)
+        person_pil  = Image.open(person_path).convert("RGB")
+        garment_pil = Image.open(garment_path).convert("RGB").resize((SIZE_W, SIZE_H))
 
-        # ── Cell 5: Segmentation + Mask ──
-        pred = self._segment(person_pil)
-        g_pred = self._segment(garment_pil)
+        # ── Step 1: Human parse + agnostic mask ──
+        agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil)
+        person_pil = person_pil.resize((SIZE_W, SIZE_H))
 
-        # Garment clean — gray fill background, then crop top 8% to remove hanger/hook
-        garment_clean_np = garment_np.copy()
-        garment_clean_np[g_pred == 0] = [128, 128, 128]
-        hanger_crop_y = int(SIZE * 0.08)
-        garment_clean_np[:hanger_crop_y, :] = [128, 128, 128]
-        g_pred_cropped = g_pred.copy()
-        g_pred_cropped[:hanger_crop_y, :] = 0
-        garment_clean_pil = Image.fromarray(garment_clean_np)
+        # ── Step 2: Prepare tensors ──
+        pose_tensor    = tensor_tf(keypoints.resize((SIZE_W, SIZE_H))).unsqueeze(0).to(self.device, torch.float16)
+        garment_tensor = tensor_tf(garment_pil).unsqueeze(0).to(self.device, torch.float16)
 
-        upper_labels = [4, 5, 7]
-        shirt_base_mask = np.isin(pred, upper_labels).astype(np.uint8)
+        # ── Step 3: Encode prompts ──
+        prompt          = "a photo of a person wearing a garment"
+        negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
+        garment_desc    = "a garment"
 
-        garment_fg = (g_pred_cropped != 0)
-        garment_fg_ys = np.where(garment_fg.any(axis=1))[0]
-        if len(garment_fg_ys) > 0:
-            g_neckline_y = int(garment_fg_ys.min())
-            neckline_row_cols = np.where(garment_fg[g_neckline_y])[0]
-            g_neck_width = int(neckline_row_cols.max() - neckline_row_cols.min()) if len(neckline_row_cols) > 0 else 120
-        else:
-            g_neckline_y, g_neck_width = 100, 120
-
-        # Face bottom boundary — collar strip spans full width to cover formal shirt collar completely
-        face_mask = (pred == 11)
-        face_ys = np.where(face_mask.any(axis=1))[0]
-        face_bottom_y = int(face_ys.max()) if len(face_ys) > 0 else None
-
-        shirt_ys = np.where(shirt_base_mask.any(axis=1))[0]
-        if len(shirt_ys) > 0:
-            shirt_top_y = int(shirt_ys.min())
-            collar_top = face_bottom_y if face_bottom_y is not None else max(0, shirt_top_y - max(50, int(g_neckline_y * 0.5)))
-            collar_strip = np.zeros((SIZE, SIZE), dtype=np.uint8)
-            # Full width — covers collar for any shirt type (formal, casual, collar, collarless)
-            collar_strip[collar_top:min(SIZE, shirt_top_y + 30), :] = 1
-        else:
-            collar_strip = np.zeros((SIZE, SIZE), dtype=np.uint8)
-
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        shirt_dilated = cv2.dilate(shirt_base_mask, k, iterations=1)
-        agnostic_mask = np.clip(shirt_dilated.astype(np.int32) + collar_strip.astype(np.int32), 0, 1).astype(np.uint8)
-        blend_mask = shirt_base_mask.copy()
-
-        agnostic_np = person_np.copy()
-        agnostic_np[agnostic_mask > 0] = [128, 128, 128]
-        agnostic_pil = Image.fromarray(agnostic_np)
-
-        # ── Cell 6: DensePose ──
-        densepose_iuv = self._get_densepose_iuv(person_np)
-
-        # ── Cell 7: AFWM Warp ──
-        import torchvision.transforms as T
-
-        seg_to_parse = {0:0, 2:1, 11:2, 3:3, 4:3, 7:3, 5:4, 6:5,
-                        8:6, 14:7, 15:8, 12:9, 13:10, 9:11, 10:12}
-        parse_map = np.zeros((13, SIZE, SIZE), dtype=np.float32)
-        for seg_lbl, parse_ch in seg_to_parse.items():
-            parse_map[parse_ch][pred == seg_lbl] = 1.0
-        parse_map[3][agnostic_mask > 0] = 0
-        parse_map[7][agnostic_mask > 0] = 0
-        parse_map[8][agnostic_mask > 0] = 0
-        parse_map[2][agnostic_mask > 0] = 1.0
-
-        warp_tf = T.Compose([T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
-        agnostic_t = warp_tf(agnostic_pil).unsqueeze(0).to(device)
-        parse_t = torch.from_numpy(parse_map).unsqueeze(0).to(device)
-        cond_input = torch.cat([agnostic_t, parse_t], dim=1)
-        garment_t = warp_tf(garment_clean_pil).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            warped_cloth, _ = self._warp_model(cond_input, garment_t)
-            warped_np = warped_cloth.squeeze().permute(1, 2, 0).cpu().numpy()
-            warped_np = ((warped_np + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
-            warped_garment_pil = Image.fromarray(warped_np)
-
-        # ── Cell 9: DCI Inference ──
-        _seed = int(hashlib.md5(job_id.encode()).hexdigest()[:8], 16) % (2**31)
-        torch.manual_seed(_seed)
-        np.random.seed(_seed)
-
-        def to_tensor(img):
-            t = torchvision.transforms.ToTensor()(img)
-            return torchvision.transforms.Normalize([0.5]*3, [0.5]*3)(t).unsqueeze(0)
-
-        def to_clip(img):
-            img = img.resize((224, 224), Image.LANCZOS)
-            t = torchvision.transforms.ToTensor()(img)
-            return torchvision.transforms.Normalize(
-                (0.48145466, 0.4578275, 0.40821073),
-                (0.26862954, 0.26130258, 0.27577711)
-            )(t).unsqueeze(0)
-
-        inpaint_image_t = to_tensor(agnostic_pil).to(device)
-        feat_tensor = to_tensor(warped_garment_pil).to(device)
-        ref_tensor = to_clip(garment_clean_pil).to(device)
-
-        mask_np_float = agnostic_mask.astype(np.float32)
-        mask_t = torch.from_numpy(mask_np_float).unsqueeze(0).unsqueeze(0).to(device)
-        inpaint_mask_tensor = 1.0 - mask_t
-
-        H, W, C, f = 512, 512, 4, 8
-
-        with torch.no_grad():
-            c = model.get_learned_conditioning(ref_tensor.to(torch.float16))
-            c = model.proj_out(c)
-            uc = model.learnable_vector.repeat(ref_tensor.size(0), 1, 1)
-
-            z_inpaint = model.encode_first_stage(inpaint_image_t)
-            z_inpaint = model.get_first_stage_encoding(z_inpaint).detach()
-
-            warp_feat = model.encode_first_stage(feat_tensor)
-            warp_feat = model.get_first_stage_encoding(warp_feat).detach()
-
-            mask_latent = Resize([z_inpaint.shape[-2], z_inpaint.shape[-1]])(inpaint_mask_tensor)
-
-            test_model_kwargs = {"inpaint_image": z_inpaint, "inpaint_mask": mask_latent}
-
-            N_STEPS = 20
-            sampler.make_schedule(ddim_num_steps=50, ddim_eta=0.0, verbose=False)
-            total = sampler.ddim_timesteps.shape[0]
-            subset_end = int(min(N_STEPS / total, 1) * total) - 1
-            T_START = int(sampler.ddim_timesteps[subset_end - 1])
-
-            ts = torch.full((1,), T_START, device=device, dtype=torch.long)
-            start_code = model.q_sample(warp_feat, ts)
-
-            samples, _ = sampler.ddim_sampling(
-                cond=c, shape=(1, C, H//f, W//f), x_T=start_code,
-                timesteps=N_STEPS, unconditional_guidance_scale=12.0,
-                unconditional_conditioning=uc, test_model_kwargs=test_model_kwargs,
+        with torch.inference_mode():
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+                pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = self._pipe.encode_prompt(
+                prompt,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True,
+                negative_prompt=negative_prompt,
             )
 
-            x_out = model.decode_first_stage(samples)
-            x_out = torch.clamp((x_out + 1.0) / 2.0, 0.0, 1.0)
-            x_out = x_out.cpu().permute(0, 2, 3, 1).numpy()[0]
+            prompt_embeds_cloth, _, _, _ = self._pipe.encode_prompt(
+                garment_desc,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+                negative_prompt=negative_prompt,
+            )
 
-        # ── Cell 10: Color Correction + Composite ──
-        result_np = (x_out * 255).astype(np.uint8)
-        shirt_mask = blend_mask > 0
-        garment_fg_mask = g_pred != 0
+        # ── Step 4: Run IDM-VTON pipeline ──
+        _seed     = int(hashlib.md5(job_id.encode()).hexdigest()[:8], 16) % (2**31)
+        generator = torch.Generator(device="cpu").manual_seed(_seed)
 
-        if shirt_mask.sum() > 200 and garment_fg_mask.sum() > 200:
-            result_lab = cv2.cvtColor(result_np, cv2.COLOR_RGB2LAB).astype(np.float32)
-            garment_lab = cv2.cvtColor(garment_np, cv2.COLOR_RGB2LAB).astype(np.float32)
-            corrected_lab = result_lab.copy()
+        with torch.inference_mode():
+            images = self._pipe(
+                prompt_embeds=prompt_embeds.to(torch.float16),
+                negative_prompt_embeds=negative_prompt_embeds.to(torch.float16),
+                pooled_prompt_embeds=pooled_prompt_embeds.to(torch.float16),
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(torch.float16),
+                num_inference_steps=30,
+                generator=generator,
+                strength=1.0,
+                pose_img=pose_tensor,
+                text_embeds_cloth=prompt_embeds_cloth.to(torch.float16),
+                cloth=garment_tensor,
+                mask_image=mask_pil,
+                image=person_pil,
+                height=SIZE_H,
+                width=SIZE_W,
+                ip_adapter_image=garment_pil,
+                guidance_scale=2.0,
+            )[0]
 
-            ref_L = garment_lab[:, :, 0][garment_fg_mask].mean()
-            res_L = result_lab[:, :, 0][shirt_mask].mean()
-            # Adaptive shift — dark garments need stronger correction
-            if ref_L < 40:
-                dL_factor = 0.75
-            elif ref_L < 80:
-                dL_factor = 0.50
-            else:
-                dL_factor = 0.35
-            dL = (ref_L - res_L) * dL_factor
-            corrected_lab[:, :, 0][shirt_mask] = np.clip(result_lab[:, :, 0][shirt_mask] + dL, 0, 255)
-
-            corrected_lab[:, :, 1][shirt_mask] = match_histograms(
-                result_lab[:, :, 1][shirt_mask], garment_lab[:, :, 1][garment_fg_mask])
-            corrected_lab[:, :, 2][shirt_mask] = match_histograms(
-                result_lab[:, :, 2][shirt_mask], garment_lab[:, :, 2][garment_fg_mask])
-
-            color_corrected_np = cv2.cvtColor(corrected_lab.astype(np.uint8), cv2.COLOR_LAB2RGB)
-        else:
-            color_corrected_np = result_np
-
-        k_comp = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        composite_mask = cv2.dilate(shirt_base_mask, k_comp, iterations=1).astype(np.float32)
-        composite_mask = cv2.GaussianBlur(composite_mask, (11, 11), 3.0)
-        composite_mask = composite_mask[:, :, np.newaxis]
-
-        final_np = (color_corrected_np.astype(np.float32) * composite_mask +
-                    person_np.astype(np.float32) * (1.0 - composite_mask)).astype(np.uint8)
-
-        final_img = Image.fromarray(final_np)
+        # ── Step 5: Save result ──
+        result = images[0]
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        final_img.save(output_path, "JPEG", quality=95)
-        logger.info(f"Result saved: {output_path}")
+        result.save(output_path, "JPEG", quality=95)
+        logger.info("IDM-VTON result saved: %s", output_path)
         return output_path
-
-
-CORRELATION_CODE = '''
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-def FunctionCorrelation(tenFirst, tenSecond, intStride=1):
-    B, C, H, W = tenFirst.shape
-    D = 3
-    tenSecond_pad = F.pad(tenSecond, [D, D, D, D])
-    result = []
-    for dy in range(2*D+1):
-        for dx in range(2*D+1):
-            shifted = tenSecond_pad[:, :, dy:dy+H, dx:dx+W]
-            corr = (tenFirst * shifted).mean(dim=1, keepdim=True)
-            result.append(corr)
-    return torch.cat(result, dim=1)
-
-class Correlation(nn.Module):
-    def __init__(self, max_displacement=4, *args, **kwargs):
-        super().__init__()
-        self.max_displacement = max_displacement
-    def forward(self, input1, input2):
-        return FunctionCorrelation(input1, input2)
-'''
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--person", required=True)
-    parser.add_argument("--garment", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--job-id", default="")
+    parser.add_argument("--person",      required=True)
+    parser.add_argument("--garment",     required=True)
+    parser.add_argument("--output",      required=True)
+    parser.add_argument("--job-id",      default="")
     parser.add_argument("--weights-dir", default="/app/ml/weights")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device",      default="cuda")
     args = parser.parse_args()
 
     engine = GPUInferenceEngine(args.weights_dir, args.device)
