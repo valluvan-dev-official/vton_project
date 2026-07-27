@@ -140,8 +140,7 @@ class GPUInferenceEngine:
             add_watermarker=False,
             safety_checker=None,
         )
-        # enable_model_cpu_offload handles 16GB GPU efficiently
-        self._pipe.enable_model_cpu_offload()
+        self._pipe.to(self.device)
         self._pipe.unet_encoder = unet_encoder
         logger.info("IDM-VTON pipeline loaded.")
 
