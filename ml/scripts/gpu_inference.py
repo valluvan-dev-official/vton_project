@@ -86,12 +86,6 @@ class GPUInferenceEngine:
         _spec.loader.exec_module(_mod)
         self._get_mask_location = _mod.get_mask_location
 
-        # preprocess/openpose/ must be in sys.path so 'annotator' resolves as namespace package
-        openpose_dir = str(self.idm_repo / "preprocess" / "openpose")
-        if openpose_dir not in sys.path:
-            sys.path.insert(0, openpose_dir)
-        from annotator.openpose.body import draw_bodypose
-        self._draw_bodypose = draw_bodypose
 
     # ── Model loading ─────────────────────────────────────────────────────────
 
@@ -154,12 +148,26 @@ class GPUInferenceEngine:
     # ── Preprocessing ─────────────────────────────────────────────────────────
 
     def _render_pose_image(self, keypoints_dict: dict, width: int, height: int) -> Image.Image:
-        """Render OpenPose keypoints dict → PIL RGB image."""
+        """Render OpenPose keypoints dict → PIL RGB image using cv2."""
+        candidate = keypoints_dict.get("pose_keypoints_2d", [])
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
-        candidate = keypoints_dict.get("candidate", [])
-        subset    = keypoints_dict.get("subset", [])
-        if len(candidate) > 0 and len(subset) > 0:
-            canvas = self._draw_bodypose(canvas, candidate, subset)
+        sx, sy = width / 384.0, height / 512.0
+        limbs = [(0,1),(1,2),(2,3),(3,4),(1,5),(5,6),(6,7),(1,8),(8,9),(9,10),
+                 (1,11),(11,12),(12,13),(0,14),(14,16),(0,15),(15,17)]
+        colors = [(255,0,0),(255,85,0),(255,170,0),(255,255,0),(170,255,0),
+                  (85,255,0),(0,255,0),(0,255,85),(0,255,170),(0,255,255),
+                  (0,170,255),(0,85,255),(0,0,255),(85,0,255),(170,0,255),
+                  (255,0,255),(255,0,170),(255,0,85)]
+        for i, (a, b) in enumerate(limbs):
+            if a < len(candidate) and b < len(candidate):
+                x1, y1 = int(candidate[a][0] * sx), int(candidate[a][1] * sy)
+                x2, y2 = int(candidate[b][0] * sx), int(candidate[b][1] * sy)
+                if not (x1 == 0 and y1 == 0) and not (x2 == 0 and y2 == 0):
+                    cv2.line(canvas, (x1, y1), (x2, y2), colors[i % len(colors)], 3)
+        for pt in candidate:
+            x, y = int(pt[0] * sx), int(pt[1] * sy)
+            if not (x == 0 and y == 0):
+                cv2.circle(canvas, (x, y), 5, (255, 255, 255), -1)
         return Image.fromarray(canvas)
 
     def _get_agnostic_mask(self, person_pil: Image.Image):
