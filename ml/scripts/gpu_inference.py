@@ -147,7 +147,7 @@ class GPUInferenceEngine:
 
     def _render_pose_image(self, keypoints_dict: dict, width: int, height: int) -> Image.Image:
         """Render OpenPose keypoints dict → PIL RGB image."""
-        from preprocess.openpose.util import draw_bodypose
+        from openpose.util import draw_bodypose
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
         candidate = keypoints_dict.get("candidate", [])
         subset    = keypoints_dict.get("subset", [])
