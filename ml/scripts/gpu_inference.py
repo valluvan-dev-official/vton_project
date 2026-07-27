@@ -140,8 +140,8 @@ class GPUInferenceEngine:
             add_watermarker=False,
             safety_checker=None,
         )
-        self._pipe.to(self.device)
         self._pipe.unet_encoder = unet_encoder
+        self._pipe.to(self.device)
         logger.info("IDM-VTON pipeline loaded.")
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
