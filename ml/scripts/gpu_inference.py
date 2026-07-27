@@ -86,7 +86,7 @@ class GPUInferenceEngine:
         _spec.loader.exec_module(_mod)
         self._get_mask_location = _mod.get_mask_location
 
-        _spec2 = _ilu.spec_from_file_location("openpose_util", str(self.idm_repo / "preprocess" / "openpose" / "util.py"))
+        _spec2 = _ilu.spec_from_file_location("openpose_util", str(self.idm_repo / "preprocess" / "openpose" / "annotator" / "openpose" / "body.py"))
         _mod2 = _ilu.module_from_spec(_spec2)
         _spec2.loader.exec_module(_mod2)
         self._draw_bodypose = _mod2.draw_bodypose
