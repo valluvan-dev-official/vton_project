@@ -72,15 +72,15 @@ class GPUInferenceEngine:
             ckpt_dst.symlink_to(ckpt_src.resolve())
             logger.info("Linked ckpt/ from weights into IDM-VTON repo.")
 
-        # Prepend so IDM-VTON's src/ and preprocess/ are importable
-        for sub in ["", "src", "preprocess"]:
+        # Prepend so IDM-VTON's src/, preprocess/, gradio_demo/ are importable
+        for sub in ["", "src", "preprocess", "gradio_demo"]:
             p = str(self.idm_repo / sub) if sub else str(self.idm_repo)
             if p not in sys.path:
                 sys.path.insert(0, p)
 
         # Pre-import utils_mask while sys.path is guaranteed correct
         import importlib.util as _ilu
-        _spec = _ilu.spec_from_file_location("utils_mask", str(self.idm_repo / "utils_mask.py"))
+        _spec = _ilu.spec_from_file_location("utils_mask", str(self.idm_repo / "gradio_demo" / "utils_mask.py"))
         _mod = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)
         self._get_mask_location = _mod.get_mask_location
