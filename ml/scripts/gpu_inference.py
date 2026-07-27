@@ -78,6 +78,13 @@ class GPUInferenceEngine:
             if p not in sys.path:
                 sys.path.insert(0, p)
 
+        # Pre-import utils_mask while sys.path is guaranteed correct
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("utils_mask", str(self.idm_repo / "utils_mask.py"))
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        self._get_mask_location = _mod.get_mask_location
+
     # ── Model loading ─────────────────────────────────────────────────────────
 
     def _load_human_parser(self):
@@ -140,12 +147,10 @@ class GPUInferenceEngine:
 
     def _get_agnostic_mask(self, person_pil: Image.Image):
         """Parse person → agnostic image + binary mask using SCHP + get_mask_location."""
-        from utils_mask import get_mask_location
-
         parse_result, _ = self._parser(person_pil.resize((PARSE_W, PARSE_H)))
         keypoints = self._openpose(person_pil.resize((PARSE_W, PARSE_H)))
 
-        mask, mask_gray = get_mask_location("hd", "upper_body", parse_result, keypoints)
+        mask, mask_gray = self._get_mask_location("hd", "upper_body", parse_result, keypoints)
         mask = mask.resize((SIZE_W, SIZE_H))
 
         import torchvision.transforms as T
