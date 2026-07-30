@@ -169,13 +169,62 @@ class GPUInferenceEngine:
                 cv2.circle(canvas, (x, y), 5, (255, 255, 255), -1)
         return Image.fromarray(canvas)
 
-    def _get_agnostic_mask(self, person_pil: Image.Image):
+    def _detect_sleeve_type(self, garment_pil: Image.Image) -> str:
+        """Detect sleeve length from garment image. Returns 'half' or 'full'."""
+        img = np.array(garment_pil.convert("RGB"))
+        h, w = img.shape[:2]
+
+        # Non-white pixels = garment pixels
+        white = (img[:, :, 0] > 240) & (img[:, :, 1] > 240) & (img[:, :, 2] > 240)
+        garment = ~white
+
+        rows = np.any(garment, axis=1)
+        if not rows.any():
+            return "half"
+
+        top    = int(np.argmax(rows))
+        bottom = int(h - np.argmax(rows[::-1]) - 1)
+        g_h    = bottom - top
+        if g_h < 10:
+            return "half"
+
+        # Check if garment pixels exist on left/right sides at 45-65% of garment height
+        # Full sleeve shirts have fabric on the sides at this zone; half sleeve shirts don't
+        mid_top = top + int(g_h * 0.45)
+        mid_bot = top + int(g_h * 0.65)
+        mid_section = garment[mid_top:mid_bot, :]
+
+        left_sleeve  = mid_section[:, :w // 4].any()
+        right_sleeve = mid_section[:, 3 * w // 4:].any()
+
+        sleeve_type = "full" if (left_sleeve and right_sleeve) else "half"
+        logger.info("Sleeve detection: %s", sleeve_type)
+        return sleeve_type
+
+    def _get_agnostic_mask(self, person_pil: Image.Image, garment_pil: Image.Image):
         """Parse person → agnostic image + binary mask using SCHP + get_mask_location."""
         parse_result, _ = self._parser(person_pil.resize((PARSE_W, PARSE_H)))
         keypoints = self._openpose(person_pil.resize((PARSE_W, PARSE_H)))
 
         mask, mask_gray = self._get_mask_location("hd", "upper_body", parse_result, keypoints)
         mask = mask.resize((SIZE_W, SIZE_H))
+
+        # For half-sleeve garments, remove arm regions from mask so arms stay visible.
+        # For full-sleeve garments, keep mask intact so sleeves cover the arms correctly.
+        sleeve_type = self._detect_sleeve_type(garment_pil)
+        if sleeve_type == "half":
+            mask_np = np.array(mask)
+            candidate = keypoints.get("pose_keypoints_2d", [])
+            sx, sy = SIZE_W / 384.0, SIZE_H / 512.0
+            # Elbow + wrist joints only (not shoulder) — keeps shoulder area masked
+            arm_joints = [3, 4, 6, 7]
+            for idx in arm_joints:
+                if idx < len(candidate):
+                    cx = int(candidate[idx][0] * sx)
+                    cy = int(candidate[idx][1] * sy)
+                    if cx > 0 or cy > 0:
+                        cv2.circle(mask_np, (cx, cy), 30, 0, -1)
+            mask = Image.fromarray(mask_np)
 
         import torchvision.transforms as T
         tensor_tf = T.Compose([
@@ -207,7 +256,7 @@ class GPUInferenceEngine:
         garment_pil = Image.open(garment_path).convert("RGB").resize((SIZE_W, SIZE_H))
 
         # ── Step 1: Human parse + agnostic mask ──
-        agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil)
+        agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil, garment_pil)
         person_pil = person_pil.resize((SIZE_W, SIZE_H))
 
         # ── Step 2: Prepare tensors ──
