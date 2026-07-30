@@ -257,7 +257,7 @@ class GPUInferenceEngine:
                 text_embeds_cloth=prompt_embeds_cloth.to(self.device, torch.float16),
                 cloth=garment_tensor,
                 mask_image=mask_pil,
-                image=person_pil,
+                image=agnostic_pil,
                 height=SIZE_H,
                 width=SIZE_W,
                 ip_adapter_image=garment_pil,
