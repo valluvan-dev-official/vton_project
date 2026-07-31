@@ -208,6 +208,8 @@ class GPUInferenceEngine:
 
         mask, mask_gray = self._get_mask_location("hd", "upper_body", parse_result, keypoints)
         mask = mask.resize((SIZE_W, SIZE_H))
+        mask_np_erode = cv2.erode(np.array(mask), np.ones((15, 15), np.uint8), iterations=1)
+        mask = Image.fromarray(mask_np_erode)
 
         # For half-sleeve garments, remove arm regions from mask so arms stay visible.
         # For full-sleeve garments, keep mask intact so sleeves cover the arms correctly.
