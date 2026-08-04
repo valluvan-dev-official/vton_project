@@ -21,7 +21,10 @@ class Job(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), default=JobStatus.pending)
     person_image_path: Mapped[str] = mapped_column(String(512))
-    garment_image_path: Mapped[str] = mapped_column(String(512))
+    garment_image_path: Mapped[str] = mapped_column(String(512))            # primary (best-quality) garment image
+    garment_image_paths: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list — all angles submitted
+    garment_size: Mapped[str] = mapped_column(String(8), default="M")
+    person_size_estimate: Mapped[str | None] = mapped_column(String(8), nullable=True)
     result_image_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     quality_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -36,6 +39,8 @@ class Job(Base):
             "status": self.status.value,
             "result_url": result_url,
             "quality_score": self.quality_score,
+            "garment_size": self.garment_size,
+            "person_size_estimate": self.person_size_estimate,
             "saved_as_training": self.saved_as_training,
             "user_consent": self.user_consent,
             "error_message": self.error_message,

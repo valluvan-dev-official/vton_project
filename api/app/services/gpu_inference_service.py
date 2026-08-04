@@ -179,13 +179,21 @@ def get_gpu_engine():
     return _engine
 
 
-def run(person_path: str, garment_path: str, output_path: str,
-        job_id: str = "") -> str:
+def run(person_path: str, garment_paths, output_path: str,
+        job_id: str = "", garment_size: str = "M") -> str:
     """Convenience module-level function — mirror of GPUInferenceEngine.run().
 
+    garment_paths may be a single path (str) or a list of paths — multiple
+    photos of the same garment from different angles/zoom levels. The engine
+    auto-picks the clearest one for inference.
+
     Ensures the output directory exists before delegating to the singleton
-    engine so callers do not need to create it themselves.
+    engine so callers do not need to create it themselves.  Returns the
+    auto-detected person body-size bucket (e.g. "M") used for fit scaling.
     """
+    if isinstance(garment_paths, str):
+        garment_paths = [garment_paths]
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     engine = get_gpu_engine()
-    return engine.run(person_path, garment_path, output_path, job_id=job_id)
+    engine.run(person_path, garment_paths, output_path, job_id=job_id, garment_size=garment_size)
+    return engine.last_person_size_estimate

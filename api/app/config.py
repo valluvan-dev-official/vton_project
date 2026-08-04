@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     USE_OWN_MODEL: bool = False
     MODEL_PATH:    str  = ""
 
+    # ── Own trained model (Phase 4) ───────────────────────────────────────────
+    # Path to a checkpoint saved by ml/src/training/train.py (VTONPipeline).
+    # When set and the file exists, InferenceRouter switches to it instead of
+    # IDM-VTON automatically on worker startup. Leave blank to keep IDM-VTON.
+    OWN_MODEL_CHECKPOINT: str = ""
+
     # Quality threshold — results with SSIM >= this auto-save as training pairs
     MIN_QUALITY_SCORE:          float = 0.65
     TRAINING_PAIR_SSIM_THRESHOLD: float = 0.65

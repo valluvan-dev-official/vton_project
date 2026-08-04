@@ -1,40 +1,62 @@
 """
-Inference router — Phase 1: placeholder | Phase 3: SageMaker DCI-VTON | Phase 4: own model
+Inference router — placeholder | local GPU (IDM-VTON) | own trained model | SageMaker
 
-Flow (Phase 3, SageMaker):
-  1. Upload person + garment images as a JSON payload to S3
-  2. Invoke the SageMaker Async Inference endpoint (sagemaker-runtime.invoke_endpoint_async)
-  3. Poll the S3 output location until the result (or failure) object appears
-  4. Download result image
-  5. Return output path
+Selection priority (decided once at worker startup, in InferenceRouter.__init__):
+  1. own model   — if OWN_MODEL_CHECKPOINT is set and the file exists
+  2. sagemaker   — disabled for GPU-EC2 deployment (commented out below)
+  3. local_gpu   — if DEVICE=cuda and WEIGHTS_DIR exists (IDM-VTON)
+  4. placeholder — fallback when nothing above is configured
 
-This replaces the previous Kaggle-notebook backend. No Kaggle dependency remains.
+This is the intended single entry point for try-on inference — tasks.py
+calls get_inference_router().run(...) rather than talking to any specific
+backend directly, so switching models is a config change (OWN_MODEL_CHECKPOINT
+in .env), not a code change.
 """
 import logging
 import time
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-# Read from settings (pydantic reads .env file) — not os.getenv which misses .env on host
+# Read from settings (pydantic reads .env file) — not os.getenv, which misses
+# values set only in .env when the process env doesn't also have them.
 from app.config import get_settings as _get_settings
 _s = _get_settings()
+
+# Where ml/src lives relative to this file (api/app/services/inference.py ->
+# vton_project/ml). In the GPU worker container ml/ is bind-mounted to
+# /app/ml (see docker-compose.gpu.yml), so that path is tried first.
+_ML_ROOT_CANDIDATES = [
+    Path("/app/ml"),
+    Path(__file__).resolve().parents[3] / "ml",
+]
+
+
+def _ensure_ml_src_on_path() -> None:
+    """Make `import src.<...>` (ml/src/...) resolve, regardless of whether
+    we're running inside the Docker worker or a local dev checkout."""
+    import sys
+    for candidate in _ML_ROOT_CANDIDATES:
+        if candidate.is_dir():
+            p = str(candidate)
+            if p not in sys.path:
+                sys.path.insert(0, p)
+            return
+    raise RuntimeError(
+        f"inference: could not locate the ml/ directory (tried {_ML_ROOT_CANDIDATES})."
+    )
 
 
 class InferenceRouter:
     def __init__(self):
         self.use_own_model: bool = False
         self._model = None
-        self._gpu_engine = None
         self._sagemaker_client = None
+        self.last_person_size_estimate = "M"
 
-        import os
-
-        # Decide mode — priority: own model (Phase 4) > SageMaker > local GPU > placeholder
-        self._mode = "placeholder"
-        device = os.getenv("DEVICE", "cpu").strip().lower()
-        weights_dir = os.getenv("WEIGHTS_DIR", "").strip()
+        device = (_s.DEVICE or "cpu").strip().lower()
+        weights_dir = (_s.WEIGHTS_DIR or "").strip()
 
         # [SAGEMAKER] Disabled for GPU-EC2 deployment.
         # To re-enable SageMaker, restore SAGEMAKER_ENDPOINT_NAME / SAGEMAKER_S3_BUCKET
@@ -46,30 +68,36 @@ class InferenceRouter:
         # elif device == "cuda" and weights_dir and Path(weights_dir).exists():
         if device == "cuda" and weights_dir and Path(weights_dir).exists():
             self._mode = "local_gpu"
-            logger.info("InferenceRouter: Local GPU mode — loading models...")
-            try:
-                from ml.scripts.gpu_inference import GPUInferenceEngine
-                self._gpu_engine = GPUInferenceEngine(weights_dir=weights_dir, device="cuda")
-                logger.info("InferenceRouter: Local GPU mode active.")
-            except Exception as exc:
-                logger.warning(f"Local GPU init failed: {exc}. Falling back.")
-                self._mode = "placeholder"
+            logger.info(
+                "InferenceRouter: Local GPU (IDM-VTON) mode selected — "
+                "engine loads lazily via gpu_inference_service on first job."
+            )
         else:
-            logger.info("InferenceRouter: Placeholder mode "
-                        "(set DEVICE=cuda + WEIGHTS_DIR to enable local GPU inference).")
+            self._mode = "placeholder"
+            logger.info(
+                "InferenceRouter: Placeholder mode "
+                "(set DEVICE=cuda + WEIGHTS_DIR to enable local GPU inference)."
+            )
 
-        # Phase 4 — own model auto-load
-        ckpt = os.getenv("OWN_MODEL_CHECKPOINT", "").strip()
-        if ckpt and Path(ckpt).exists():
+        # Own model (Phase 4) — auto-switch if a checkpoint is configured.
+        # Takes priority over everything above once loaded (see run()).
+        own_ckpt = (_s.OWN_MODEL_CHECKPOINT or "").strip()
+        if own_ckpt and Path(own_ckpt).exists():
             try:
-                self.switch_to_own_model(ckpt)
+                self.switch_to_own_model(own_ckpt)
             except Exception as exc:
-                logger.warning(f"Own model load failed: {exc}. Falling back.")
+                logger.warning(f"InferenceRouter: own model load failed: {exc}. Falling back.")
 
     # ── Preprocessing ──────────────────────────────────────────────────────────
 
     def _preprocess_garment(self, garment_path: str) -> str:
-        """Remove garment background → white bg. Falls back to original on failure."""
+        """Remove garment background → white bg. Falls back to original on failure.
+
+        This matters beyond cosmetics: GPUInferenceEngine's sleeve-type
+        detection and best-image scoring both assume a near-white background
+        to separate garment pixels from background, so every garment image
+        handed to any backend goes through this first.
+        """
         try:
             from rembg import remove as rembg_remove
             img = Image.open(garment_path).convert("RGBA")
@@ -87,33 +115,68 @@ class InferenceRouter:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def run(self, person_image_path: str, garment_image_path: str, output_path: str) -> str:
-        garment_image_path = self._preprocess_garment(garment_image_path)
+    def run(self, person_image_path: str, garment_image_paths,
+            output_path: str, job_id: str = "", garment_size: str = "M") -> str:
+        """garment_image_paths: a single path, or a list of paths (multiple
+        angles of the same garment — only the local_gpu/IDM-VTON backend
+        actually makes use of more than one; other backends use the first).
+
+        Returns output_path. The auto-detected person body-size bucket (when
+        available) is left on self.last_person_size_estimate for the caller
+        to read — kept off the return value so this stays a drop-in
+        replacement for any backend that doesn't estimate it (own model,
+        placeholder, SageMaker all report "M" — unknown/neutral).
+        """
+        if isinstance(garment_image_paths, str):
+            garment_image_paths = [garment_image_paths]
+        garment_size = (garment_size or "M").strip().upper()
+        job_id = job_id or Path(output_path).stem
+
+        clean_garment_paths = [self._preprocess_garment(p) for p in garment_image_paths]
+        self.last_person_size_estimate = "M"
+
         if self.use_own_model and self._model:
-            return self._run_own_model(person_image_path, garment_image_path, output_path)
+            try:
+                return self._run_own_model(person_image_path, clean_garment_paths[0], output_path)
+            except Exception as exc:
+                logger.warning(f"Own-model inference failed: {exc}. Falling back.")
+
         if self._mode == "sagemaker":
             try:
-                return self._run_sagemaker(person_image_path, garment_image_path, output_path)
+                return self._run_sagemaker(person_image_path, clean_garment_paths[0], output_path)
             except Exception as exc:
                 logger.warning(f"SageMaker inference failed: {exc}. Falling back to placeholder.")
-        if self._mode == "local_gpu" and self._gpu_engine:
+
+        if self._mode == "local_gpu":
             try:
-                job_id = Path(output_path).stem
-                return self._gpu_engine.run(person_image_path, garment_image_path, output_path, job_id)
+                from app.services.gpu_inference_service import run as _gpu_run
+                self.last_person_size_estimate = _gpu_run(
+                    person_image_path, clean_garment_paths, output_path,
+                    job_id=job_id, garment_size=garment_size,
+                )
+                return output_path
             except Exception as exc:
                 logger.warning(f"Local GPU inference failed: {exc}. Falling back to placeholder.")
-        return self._run_placeholder(person_image_path, garment_image_path, output_path)
+
+        return self._run_placeholder(person_image_path, clean_garment_paths[0], output_path)
 
     def switch_to_own_model(self, model_path: str) -> None:
         self._model = self._load_model(model_path)
         self.use_own_model = True
-        logger.info(f"Switched to own model: {model_path}")
+        logger.info(f"InferenceRouter: switched to own model checkpoint: {model_path}")
 
-    # ── Phase 1: Placeholder ───────────────────────────────────────────────────
+    def switch_to_idm_vton(self) -> None:
+        """Undo switch_to_own_model() — go back to IDM-VTON / placeholder
+        (whichever local_gpu detection picked at startup) without a restart."""
+        self.use_own_model = False
+        self._model = None
+        logger.info("InferenceRouter: switched back to IDM-VTON / placeholder.")
+
+    # ── Placeholder ─────────────────────────────────────────────────────────────
 
     def _run_placeholder(self, person_path: str, garment_path: str, output_path: str) -> str:
         time.sleep(3)
-        person_img  = Image.open(person_path).convert("RGB").resize((512, 512))
+        person_img = Image.open(person_path).convert("RGB").resize((512, 512))
         garment_img = Image.open(garment_path).convert("RGB").resize((256, 256))
         canvas = person_img.copy()
         canvas.paste(garment_img, (128, 100))
@@ -128,7 +191,7 @@ class InferenceRouter:
         canvas.save(output_path, "JPEG", quality=90)
         return output_path
 
-    # ── Phase 3: SageMaker Async Inference ──────────────────────────────────────
+    # ── SageMaker Async Inference ────────────────────────────────────────────────
 
     def _run_sagemaker(self, person_path: str, garment_path: str, output_path: str) -> str:
         from app.services.sagemaker_client import get_sagemaker_client
@@ -139,13 +202,17 @@ class InferenceRouter:
         logger.info(f"[SageMaker] Inference complete for job {job_id}")
         return result_path
 
-    # ── Phase 4: Own Model ─────────────────────────────────────────────────────
+    # ── Own model (VTONPipeline, trained by ml/src/training/train.py) ───────────
 
     def _load_model(self, model_path: str):
-        raise NotImplementedError(f"Wire up your trained model loader. checkpoint={model_path}")
+        _ensure_ml_src_on_path()
+        from src.inference.infer import VTONInference
+        device = (_s.DEVICE or "cpu").strip()
+        logger.info(f"InferenceRouter: loading own-model checkpoint {model_path} (device={device})...")
+        return VTONInference(checkpoint_path=model_path, device=device)
 
     def _run_own_model(self, person_path: str, garment_path: str, output_path: str) -> str:
-        raise NotImplementedError("Wire up your trained model inference here.")
+        return self._model.run(person_path, garment_path, output_path)
 
 
 _router: InferenceRouter | None = None

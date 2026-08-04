@@ -28,6 +28,36 @@ logger = logging.getLogger(__name__)
 SIZE_W, SIZE_H = 768, 1024
 PARSE_W, PARSE_H = 384, 512
 
+SIZE_ORDER = ["XS", "S", "M", "L", "XL", "XXL"]
+
+
+def _letterbox(img: Image.Image, target_w: int, target_h: int, fill=(255, 255, 255)):
+    """Resize preserving aspect ratio, pad to (target_w, target_h). No distortion.
+
+    Returns (canvas, meta) where meta lets the padding be undone later via
+    _unletterbox(). This replaces naive Image.resize(), which stretches/
+    squishes the subject whenever the input aspect ratio isn't already
+    target_w:target_h — that stretching is what makes the person's body look
+    shrunk/distorted in the final composite.
+    """
+    w, h = img.size
+    scale = min(target_w / w, target_h / h)
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new("RGB", (target_w, target_h), fill)
+    off_x, off_y = (target_w - new_w) // 2, (target_h - new_h) // 2
+    canvas.paste(resized, (off_x, off_y))
+    meta = {"off_x": off_x, "off_y": off_y, "new_w": new_w, "new_h": new_h,
+            "orig_w": w, "orig_h": h}
+    return canvas, meta
+
+
+def _unletterbox(img: Image.Image, meta: dict) -> Image.Image:
+    """Crop out the letterbox padding and resize back to the original image size."""
+    box = (meta["off_x"], meta["off_y"],
+           meta["off_x"] + meta["new_w"], meta["off_y"] + meta["new_h"])
+    return img.crop(box).resize((meta["orig_w"], meta["orig_h"]), Image.LANCZOS)
+
 
 class GPUInferenceEngine:
     """Preloads all IDM-VTON models once, then runs inference per-job."""
@@ -39,6 +69,7 @@ class GPUInferenceEngine:
         self.idm_path    = self.weights_dir / "idm_vton"
         self.workspace   = Path(workspace)
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self.last_person_size_estimate = "M"
 
         self._ensure_repos()
         self._load_human_parser()
@@ -201,13 +232,161 @@ class GPUInferenceEngine:
         logger.info("Sleeve detection: %s", sleeve_type)
         return sleeve_type
 
-    def _get_agnostic_mask(self, person_pil: Image.Image, garment_pil: Image.Image):
-        """Parse person → agnostic image + binary mask using SCHP + get_mask_location."""
+    def _estimate_person_size(self, keypoints: dict, fallback_height_px: float) -> str:
+        """Auto-detect a body-size bucket (S/M/L/XL/...) from pose keypoints.
+
+        Pixel measurements are scale-free once normalised by the person's own
+        height in the *same* image, so no real-world reference object is
+        needed. We use shoulder width (keypoints 2, 5) divided by an
+        estimated standing height (neck→mid-hip torso length × ~3.05, the
+        typical torso:height ratio). Thresholds are calibrated against
+        average adult shoulder-width/height ratios and are necessarily
+        approximate — good enough to pick a relative garment fit, not a
+        substitute for real anthropometric measurement.
+        """
+        candidate = keypoints.get("pose_keypoints_2d", [])
+
+        def pt(i):
+            if i >= len(candidate):
+                return None
+            x, y = candidate[i][0], candidate[i][1]
+            return (x, y) if (x > 0 or y > 0) else None
+
+        r_sh, l_sh, neck = pt(2), pt(5), pt(1)
+        r_hip, l_hip = pt(8), pt(11)
+
+        if not (r_sh and l_sh):
+            return "M"
+
+        shoulder_w = abs(l_sh[0] - r_sh[0])
+
+        hip_pts = [p for p in (r_hip, l_hip) if p]
+        if neck and hip_pts:
+            mid_hip_y = sum(p[1] for p in hip_pts) / len(hip_pts)
+            torso_h = abs(mid_hip_y - neck[1])
+            body_h = torso_h * 3.05 if torso_h > 0 else fallback_height_px
+        else:
+            body_h = fallback_height_px
+
+        if body_h <= 0 or shoulder_w <= 0:
+            return "M"
+
+        ratio = shoulder_w / body_h
+        thresholds = [(0.235, "S"), (0.255, "M"), (0.275, "L"), (0.295, "XL")]
+        for limit, label in thresholds:
+            if ratio <= limit:
+                return label
+        return "XXL"
+
+    def _fit_scale_factor(self, person_size: str, garment_size: str) -> float:
+        """Combine detected person size + requested garment size into a scale
+        multiplier: an L garment on an M person should sit looser/larger than
+        an M garment on an M person, and vice versa for a size-down."""
+        p_idx = SIZE_ORDER.index(person_size) if person_size in SIZE_ORDER else SIZE_ORDER.index("M")
+        g_idx = SIZE_ORDER.index(garment_size) if garment_size in SIZE_ORDER else p_idx
+
+        diff = g_idx - p_idx
+        factor = 1.0 + diff * 0.06  # ~6% garment growth per size step
+        return max(0.75, min(factor, 1.35))
+
+    def _pick_best_garment_image(self, garment_paths: list[str]) -> str:
+        """Given several photos of the SAME garment (different angles/zoom/
+        lighting), pick the one best suited for inference: sharp focus and a
+        large, clearly-visible garment (not a tiny/cropped/blurry shot).
+
+        The underlying IDM-VTON pipeline conditions on a single garment
+        image, so multi-angle inputs aren't fused into one representation —
+        we instead select the clearest single view. The other angles are
+        still stored with the job for QA/training-data purposes.
+        """
+        if len(garment_paths) == 1:
+            return garment_paths[0]
+
+        best_path, best_score = garment_paths[0], -1.0
+        for p in garment_paths:
+            try:
+                img = np.array(Image.open(p).convert("RGB"))
+            except Exception:
+                continue
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+            # Coverage: fraction of non-near-white pixels (garment vs. blank background)
+            white = (img[:, :, 0] > 240) & (img[:, :, 1] > 240) & (img[:, :, 2] > 240)
+            coverage = 1.0 - white.mean()
+
+            score = sharpness * max(coverage, 0.05)
+            logger.info("Garment candidate %s: sharpness=%.1f coverage=%.2f score=%.1f",
+                        p, sharpness, coverage, score)
+            if score > best_score:
+                best_path, best_score = p, score
+
+        logger.info("Selected garment image: %s", best_path)
+        return best_path
+
+    def _encode_clip_image_embeds(self, pil_img: Image.Image):
+        """Run one image through the pipeline's IP-Adapter CLIP vision encoder
+        and return its [1, embed_dim] image embedding (fp16, on self.device)."""
+        pixel_values = self._pipe.feature_extractor(images=pil_img, return_tensors="pt").pixel_values
+        pixel_values = pixel_values.to(self.device, dtype=self._pipe.image_encoder.dtype)
+        with torch.inference_mode():
+            return self._pipe.image_encoder(pixel_values).image_embeds
+
+    def _build_ip_adapter_embeds(self, garment_pils: list[Image.Image]):
+        """Average CLIP image embeddings across ALL submitted garment angles
+        into one appearance-conditioning embedding (front view, close-up
+        print/texture shot, back view, etc. all contribute), rather than
+        conditioning on just a single selected photo.
+
+        Returns a CFG-ready embedding tensor ([uncond, cond] stacked, per
+        diffusers IP-Adapter convention) suitable for `ip_adapter_image_embeds`,
+        or None if anything about the pipeline's IP-Adapter internals doesn't
+        match expectations — callers should fall back to `ip_adapter_image=`
+        with a single image in that case rather than fail the whole job.
+        """
+        try:
+            embeds = [self._encode_clip_image_embeds(img) for img in garment_pils]
+            avg_embed = torch.stack(embeds, dim=0).mean(dim=0)  # [1, embed_dim]
+            negative_embed = torch.zeros_like(avg_embed)
+            cfg_embed = torch.cat([negative_embed, avg_embed], dim=0)  # [uncond, cond]
+            return [cfg_embed.to(self.device, torch.float16)]
+        except Exception:
+            logger.exception(
+                "Multi-image IP-Adapter embedding averaging failed — "
+                "falling back to single-image ip_adapter_image."
+            )
+            return None
+
+    def _get_agnostic_mask(self, person_pil: Image.Image, garment_pil: Image.Image,
+                            garment_size: str = "M"):
+        """Parse person → agnostic image + binary mask using SCHP + get_mask_location.
+
+        person_pil is expected to already be letterboxed to SIZE_W:SIZE_H
+        (same 3:4 aspect as PARSE_W:PARSE_H), so the resize below is a
+        uniform downscale, not a distortion.
+        """
         parse_result, _ = self._parser(person_pil.resize((PARSE_W, PARSE_H)))
         keypoints = self._openpose(person_pil.resize((PARSE_W, PARSE_H)))
 
+        self.last_person_size_estimate = self._estimate_person_size(keypoints, PARSE_H)
+
         mask, mask_gray = self._get_mask_location("hd", "upper_body", parse_result, keypoints)
         mask = mask.resize((SIZE_W, SIZE_H))
+
+        # Grow/shrink the mask region for a size-up/size-down garment so the
+        # repainted area matches how loose or tight the requested size should
+        # actually sit versus the detected body size.
+        fit_factor = self._fit_scale_factor(self.last_person_size_estimate, garment_size)
+        if abs(fit_factor - 1.0) > 1e-3:
+            kernel_px = int(round(abs(fit_factor - 1.0) * 40))  # ~40px per 100% delta
+            if kernel_px > 0:
+                kernel = np.ones((kernel_px, kernel_px), np.uint8)
+                mask_np = np.array(mask)
+                if fit_factor > 1.0:
+                    mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+                else:
+                    mask_np = cv2.erode(mask_np, kernel, iterations=1)
+                mask = Image.fromarray(mask_np)
 
         # For half-sleeve garments, remove arm regions from mask so arms stay visible.
         # For full-sleeve garments, keep mask intact so sleeves cover the arms correctly.
@@ -243,23 +422,50 @@ class GPUInferenceEngine:
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def run(self, person_path: str, garment_path: str,
-            output_path: str, job_id: str = "") -> str:
+    def run(self, person_path: str, garment_paths, output_path: str,
+            job_id: str = "", garment_size: str = "M") -> str:
+        """garment_paths: path to a single garment photo, or a list of paths —
+        multiple angles/zoom levels of the SAME garment. The clearest one
+        drives the spatial garment-warping channel (see
+        _pick_best_garment_image); ALL of them contribute to the appearance/
+        texture conditioning via averaged CLIP embeddings (see
+        _build_ip_adapter_embeds)."""
         import torchvision.transforms as T
 
         if not job_id:
             job_id = Path(output_path).stem
+        garment_size = (garment_size or "M").strip().upper()
+        if isinstance(garment_paths, str):
+            garment_paths = [garment_paths]
 
         tensor_tf = T.Compose([T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
 
-        person_pil  = Image.open(person_path).convert("RGB")
-        garment_pil = Image.open(garment_path).convert("RGB").resize((SIZE_W, SIZE_H))
+        garment_path = self._pick_best_garment_image(garment_paths)
+        person_orig = Image.open(person_path).convert("RGB")
+        garment_orig = Image.open(garment_path).convert("RGB")
+
+        # Raw (un-letterboxed) copies of every submitted angle, for the
+        # appearance/texture (IP-Adapter) conditioning below — CLIP's own
+        # feature extractor handles resizing, so no letterbox needed here.
+        all_garment_pils_raw = [Image.open(p).convert("RGB") for p in garment_paths]
+
+        # Letterbox (aspect-preserving resize + pad) instead of a naive
+        # resize — a naive resize stretches/squishes the subject whenever the
+        # source photo isn't already 768:1024, which is what was making the
+        # person's body look shrunk/distorted in the output. The padding is
+        # undone on the final result before saving (Step 5).
+        person_pil, person_lb_meta = _letterbox(person_orig, SIZE_W, SIZE_H)
+        garment_pil, _ = _letterbox(garment_orig, SIZE_W, SIZE_H)
 
         # ── Step 1: Human parse + agnostic mask ──
-        agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil, garment_pil)
-        person_pil = person_pil.resize((SIZE_W, SIZE_H))
+        agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(
+            person_pil, garment_pil, garment_size=garment_size,
+        )
+        person_size = self.last_person_size_estimate
+        logger.info("Detected person size: %s | requested garment size: %s",
+                    person_size, garment_size)
 
-        # ── Step 1b: Scale garment to person shoulder width ──
+        # ── Step 1b: Scale garment to person shoulder width + requested fit ──
         candidate = keypoints.get("pose_keypoints_2d", [])
         sx = SIZE_W / PARSE_W
         if len(candidate) > 5:
@@ -270,7 +476,11 @@ class GPUInferenceEngine:
                 # Reference: assume garment occupies ~55% of SIZE_W at standard fit
                 ref_shoulder_w = SIZE_W * 0.55
                 scale = person_shoulder_w / ref_shoulder_w
-                scale = max(0.7, min(scale, 1.2))  # clamp: avoid extreme scaling
+                # Blend in the requested garment size vs. detected person size —
+                # an L garment on an M person should render bigger/looser than
+                # an M garment on the same person, and vice versa.
+                scale *= self._fit_scale_factor(person_size, garment_size)
+                scale = max(0.65, min(scale, 1.45))  # clamp: avoid extreme scaling
                 new_w = int(SIZE_W * scale)
                 new_h = int(SIZE_H * scale)
                 garment_scaled = garment_pil.resize((new_w, new_h), Image.LANCZOS)
@@ -280,12 +490,21 @@ class GPUInferenceEngine:
                 paste_y = (SIZE_H - new_h) // 2
                 canvas.paste(garment_scaled, (paste_x, paste_y))
                 garment_pil = canvas
-                logger.info("Garment scaled by %.2f (shoulder_w=%.0fpx)", scale, person_shoulder_w)
+                logger.info("Garment scaled by %.2f (shoulder_w=%.0fpx, fit=%s->%s)",
+                            scale, person_shoulder_w, person_size, garment_size)
 
         # ── Step 2: Prepare tensors ──
         pose_img       = self._render_pose_image(keypoints, SIZE_W, SIZE_H)
         pose_tensor    = tensor_tf(pose_img).unsqueeze(0).to(self.device, torch.float16)
         garment_tensor = tensor_tf(garment_pil).unsqueeze(0).to(self.device, torch.float16)
+
+        # Appearance/texture conditioning — average CLIP embeddings across
+        # every submitted garment angle so print/texture details visible only
+        # in a close-up shot (say) still inform the result, not just whichever
+        # single image drives the spatial `cloth` channel above.
+        ip_adapter_embeds = None
+        if len(all_garment_pils_raw) > 1:
+            ip_adapter_embeds = self._build_ip_adapter_embeds(all_garment_pils_raw)
 
         # ── Step 3: Encode prompts ──
         prompt          = "a photo of a person wearing a garment"
@@ -316,6 +535,14 @@ class GPUInferenceEngine:
         _seed     = int(hashlib.md5(job_id.encode()).hexdigest()[:8], 16) % (2**31)
         generator = torch.Generator(device="cpu").manual_seed(_seed)
 
+        # Pass either the pre-computed multi-image averaged embedding, or
+        # fall back to the single best garment image — whichever is available.
+        ip_adapter_kwargs = (
+            {"ip_adapter_image_embeds": ip_adapter_embeds}
+            if ip_adapter_embeds is not None
+            else {"ip_adapter_image": garment_pil}
+        )
+
         with torch.inference_mode():
             images = self._pipe(
                 prompt_embeds=prompt_embeds.to(self.device, torch.float16),
@@ -332,15 +559,17 @@ class GPUInferenceEngine:
                 image=person_pil,
                 height=SIZE_H,
                 width=SIZE_W,
-                ip_adapter_image=garment_pil,
                 guidance_scale=2.5,
+                **ip_adapter_kwargs,
             )[0]
 
-        # ── Step 5: Save result ──
+        # ── Step 5: Undo letterbox padding, restore original aspect ratio, save ──
         result = images[0]
+        result = _unletterbox(result, person_lb_meta)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path, "JPEG", quality=95)
-        logger.info("IDM-VTON result saved: %s", output_path)
+        logger.info("IDM-VTON result saved: %s (restored to original %dx%d)",
+                    output_path, person_lb_meta["orig_w"], person_lb_meta["orig_h"])
         return output_path
 
 
@@ -348,12 +577,14 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("--person",      required=True)
-    parser.add_argument("--garment",     required=True)
+    parser.add_argument("--garment",     required=True, nargs="+",
+                         help="One or more paths — same garment, different angles.")
     parser.add_argument("--output",      required=True)
     parser.add_argument("--job-id",      default="")
     parser.add_argument("--weights-dir", default="/app/ml/weights")
     parser.add_argument("--device",      default="cuda")
+    parser.add_argument("--garment-size", default="M")
     args = parser.parse_args()
 
     engine = GPUInferenceEngine(args.weights_dir, args.device)
-    engine.run(args.person, args.garment, args.output, args.job_id)
+    engine.run(args.person, args.garment, args.output, args.job_id, args.garment_size)
