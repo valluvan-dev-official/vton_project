@@ -259,6 +259,29 @@ class GPUInferenceEngine:
         agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil, garment_pil)
         person_pil = person_pil.resize((SIZE_W, SIZE_H))
 
+        # ── Step 1b: Scale garment to person shoulder width ──
+        candidate = keypoints.get("pose_keypoints_2d", [])
+        sx = SIZE_W / PARSE_W
+        if len(candidate) > 5:
+            r_shoulder = candidate[2]
+            l_shoulder = candidate[5]
+            if (r_shoulder[0] > 0 or r_shoulder[1] > 0) and (l_shoulder[0] > 0 or l_shoulder[1] > 0):
+                person_shoulder_w = abs(l_shoulder[0] - r_shoulder[0]) * sx
+                # Reference: assume garment occupies ~55% of SIZE_W at standard fit
+                ref_shoulder_w = SIZE_W * 0.55
+                scale = person_shoulder_w / ref_shoulder_w
+                scale = max(0.7, min(scale, 1.2))  # clamp: avoid extreme scaling
+                new_w = int(SIZE_W * scale)
+                new_h = int(SIZE_H * scale)
+                garment_scaled = garment_pil.resize((new_w, new_h), Image.LANCZOS)
+                # Paste on white canvas of SIZE_W x SIZE_H (center it)
+                canvas = Image.new("RGB", (SIZE_W, SIZE_H), (255, 255, 255))
+                paste_x = (SIZE_W - new_w) // 2
+                paste_y = (SIZE_H - new_h) // 2
+                canvas.paste(garment_scaled, (paste_x, paste_y))
+                garment_pil = canvas
+                logger.info("Garment scaled by %.2f (shoulder_w=%.0fpx)", scale, person_shoulder_w)
+
         # ── Step 2: Prepare tensors ──
         pose_img       = self._render_pose_image(keypoints, SIZE_W, SIZE_H)
         pose_tensor    = tensor_tf(pose_img).unsqueeze(0).to(self.device, torch.float16)
