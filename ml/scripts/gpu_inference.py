@@ -29,8 +29,6 @@ SIZE_W, SIZE_H = 768, 1024
 PARSE_W, PARSE_H = 384, 512
 
 
-<<<<<<< HEAD
-=======
 def _debug_visualization_enabled() -> bool:
     return os.getenv("DEBUG_VISUALIZATION", "false").strip().lower() == "true"
 
@@ -51,7 +49,6 @@ def _save_debug_image(img, path: Path, label: str) -> None:
         logger.warning("[DEBUG_VISUALIZATION] failed to save %s: %s", label, path, exc_info=True)
 
 
->>>>>>> 2efbafa (changes done)
 class GPUInferenceEngine:
     """Preloads all IDM-VTON models once, then runs inference per-job."""
 
@@ -224,22 +221,15 @@ class GPUInferenceEngine:
         logger.info("Sleeve detection: %s", sleeve_type)
         return sleeve_type
 
-<<<<<<< HEAD
-    def _get_agnostic_mask(self, person_pil: Image.Image, garment_pil: Image.Image):
-=======
     def _get_agnostic_mask(self, person_pil: Image.Image, garment_pil: Image.Image,
                            debug_dir: Path | None = None):
->>>>>>> 2efbafa (changes done)
         """Parse person → agnostic image + binary mask using SCHP + get_mask_location."""
         parse_result, _ = self._parser(person_pil.resize((PARSE_W, PARSE_H)))
         keypoints = self._openpose(person_pil.resize((PARSE_W, PARSE_H)))
 
-<<<<<<< HEAD
-=======
         if debug_dir is not None:
             _save_debug_image(parse_result, debug_dir / "02_parsing_mask.png", "human parsing mask")
 
->>>>>>> 2efbafa (changes done)
         mask, mask_gray = self._get_mask_location("hd", "upper_body", parse_result, keypoints)
         mask = mask.resize((SIZE_W, SIZE_H))
 
@@ -273,12 +263,9 @@ class GPUInferenceEngine:
         agnostic = person_pil.resize((SIZE_W, SIZE_H)).copy()
         agnostic.paste(mask_gray_img, None, Image.fromarray(np.uint8(mask)))
 
-<<<<<<< HEAD
-=======
         if debug_dir is not None:
             _save_debug_image(mask, debug_dir / "04_agnostic_mask.png", "agnostic mask")
 
->>>>>>> 2efbafa (changes done)
         return agnostic, mask, keypoints
 
     # ── Inference ─────────────────────────────────────────────────────────────
@@ -290,26 +277,18 @@ class GPUInferenceEngine:
         if not job_id:
             job_id = Path(output_path).stem
 
-<<<<<<< HEAD
-=======
         debug_dir = self.workspace / "debug" / job_id if _debug_visualization_enabled() else None
 
->>>>>>> 2efbafa (changes done)
         tensor_tf = T.Compose([T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
 
         person_pil  = Image.open(person_path).convert("RGB")
         garment_pil = Image.open(garment_path).convert("RGB").resize((SIZE_W, SIZE_H))
 
-<<<<<<< HEAD
-        # ── Step 1: Human parse + agnostic mask ──
-        agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil, garment_pil)
-=======
         if debug_dir is not None:
             _save_debug_image(person_pil, debug_dir / "01_person_original.jpg", "original person image")
 
         # ── Step 1: Human parse + agnostic mask ──
         agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil, garment_pil, debug_dir=debug_dir)
->>>>>>> 2efbafa (changes done)
         person_pil = person_pil.resize((SIZE_W, SIZE_H))
 
         # ── Step 1b: Scale garment to person shoulder width ──
@@ -340,12 +319,9 @@ class GPUInferenceEngine:
         pose_tensor    = tensor_tf(pose_img).unsqueeze(0).to(self.device, torch.float16)
         garment_tensor = tensor_tf(garment_pil).unsqueeze(0).to(self.device, torch.float16)
 
-<<<<<<< HEAD
-=======
         if debug_dir is not None:
             _save_debug_image(pose_img, debug_dir / "03_openpose_keypoints.png", "OpenPose keypoint visualization")
 
->>>>>>> 2efbafa (changes done)
         # ── Step 3: Encode prompts ──
         prompt          = "a photo of a person wearing a garment"
         negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
@@ -400,8 +376,6 @@ class GPUInferenceEngine:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path, "JPEG", quality=95)
         logger.info("IDM-VTON result saved: %s", output_path)
-<<<<<<< HEAD
-=======
 
         if debug_dir is not None:
             # No explicit garment-warping step exists in the IDM-VTON pipeline (the
@@ -410,8 +384,6 @@ class GPUInferenceEngine:
             # image to export here.
             _save_debug_image(result, debug_dir / "06_final_output.jpg", "final output image")
             logger.info("[DEBUG_VISUALIZATION] debug images for job %s saved to %s", job_id, debug_dir)
-
->>>>>>> 2efbafa (changes done)
         return output_path
 
 
