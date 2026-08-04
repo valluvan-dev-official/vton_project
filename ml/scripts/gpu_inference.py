@@ -23,6 +23,8 @@ import torch
 import cv2
 from PIL import Image
 
+from letterbox_geometry import LetterboxTransform, compute_letterbox_geometry
+
 logger = logging.getLogger(__name__)
 
 SIZE_W, SIZE_H = 768, 1024
@@ -31,6 +33,47 @@ PARSE_W, PARSE_H = 384, 512
 
 def _debug_visualization_enabled() -> bool:
     return os.getenv("DEBUG_VISUALIZATION", "false").strip().lower() == "true"
+
+
+def _letterbox_image(img: Image.Image, target_w: int, target_h: int,
+                      fill=(255, 255, 255), resample=Image.LANCZOS):
+    """Resize `img` to fit inside (target_w, target_h) preserving aspect ratio,
+    then pad (letterbox) to exactly that size.
+
+    Directly stretching a non-3:4 photo onto the model's 3:4 canvas distorts
+    body proportions (taller/thinner torso). Letterboxing keeps geometry
+    intact; `_unletterbox_image` inverts it on the final result.
+
+    `resample` should be LANCZOS/BICUBIC for photographic RGB content, NEAREST
+    for semantic parsing / binary mask images. Works for any input size —
+    nothing here is specific to one job's dimensions.
+
+    Returns (canvas, LetterboxTransform) — pass the transform to
+    `_unletterbox_image` to invert this exact resize later.
+    """
+    orig_w, orig_h = img.size
+    transform = compute_letterbox_geometry(orig_w, orig_h, target_w, target_h)
+    resized = img.resize((transform.new_w, transform.new_h), resample)
+    canvas = Image.new(img.mode, (target_w, target_h), fill)
+    canvas.paste(resized, (transform.pad_x, transform.pad_y))
+    return canvas, transform
+
+
+def _unletterbox_image(img: Image.Image, transform: LetterboxTransform,
+                        resample=Image.LANCZOS) -> Image.Image:
+    """Invert `_letterbox_image`: crop the padded canvas back to the fitted
+    region, then resize to the transform's original width/height exactly.
+
+    Crop coordinates are clamped to the actual image bounds as a safeguard
+    against off-by-one rounding drift between the forward and inverse pass.
+    """
+    w, h = img.size
+    x0 = max(0, min(transform.pad_x, w))
+    y0 = max(0, min(transform.pad_y, h))
+    x1 = max(x0, min(transform.pad_x + transform.new_w, w))
+    y1 = max(y0, min(transform.pad_y + transform.new_h, h))
+    cropped = img.crop((x0, y0, x1, y1))
+    return cropped.resize((transform.orig_w, transform.orig_h), resample)
 
 
 def _save_debug_image(img, path: Path, label: str) -> None:
@@ -231,7 +274,9 @@ class GPUInferenceEngine:
             _save_debug_image(parse_result, debug_dir / "02_parsing_mask.png", "human parsing mask")
 
         mask, mask_gray = self._get_mask_location("hd", "upper_body", parse_result, keypoints)
-        mask = mask.resize((SIZE_W, SIZE_H))
+        # NEAREST: `mask` is a binary/label image — smooth resampling would
+        # blur 0/255 edges into intermediate gray values.
+        mask = mask.resize((SIZE_W, SIZE_H), Image.NEAREST)
 
         # For half-sleeve garments, remove arm regions from mask so arms stay visible.
         # For full-sleeve garments, keep mask intact so sleeves cover the arms correctly.
@@ -281,15 +326,25 @@ class GPUInferenceEngine:
 
         tensor_tf = T.Compose([T.ToTensor(), T.Normalize([0.5]*3, [0.5]*3)])
 
-        person_pil  = Image.open(person_path).convert("RGB")
+        person_pil_raw = Image.open(person_path).convert("RGB")
         garment_pil = Image.open(garment_path).convert("RGB").resize((SIZE_W, SIZE_H))
 
         if debug_dir is not None:
-            _save_debug_image(person_pil, debug_dir / "01_person_original.jpg", "original person image")
+            _save_debug_image(person_pil_raw, debug_dir / "01_person_original.jpg", "original person image")
+
+        # ── Step 0: Letterbox person to SIZE_W x SIZE_H without distorting
+        # geometry (replaces a direct stretch-resize that squashed non-3:4
+        # photos). Parsing, OpenPose and masks are all derived from this same
+        # letterboxed canvas below, so they inherit its padding automatically —
+        # no separate letterbox call is needed for them.
+        person_pil, letterbox_transform = _letterbox_image(person_pil_raw, SIZE_W, SIZE_H)
+
+        if debug_dir is not None:
+            _save_debug_image(person_pil, debug_dir / "01b_person_letterboxed.jpg",
+                               "letterboxed person image (pipeline input)")
 
         # ── Step 1: Human parse + agnostic mask ──
         agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil, garment_pil, debug_dir=debug_dir)
-        person_pil = person_pil.resize((SIZE_W, SIZE_H))
 
         # ── Step 1b: Scale garment to person shoulder width ──
         candidate = keypoints.get("pose_keypoints_2d", [])
@@ -372,17 +427,21 @@ class GPUInferenceEngine:
             )[0]
 
         # ── Step 5: Save result ──
-        result = images[0]
+        # Crop the letterbox padding back out and restore the exact original
+        # person-image dimensions (undoes Step 0).
+        result = _unletterbox_image(images[0], letterbox_transform)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path, "JPEG", quality=95)
-        logger.info("IDM-VTON result saved: %s", output_path)
+        logger.info("IDM-VTON result saved: %s (restored to original %dx%d)",
+                    output_path, letterbox_transform.orig_w, letterbox_transform.orig_h)
 
         if debug_dir is not None:
             # No explicit garment-warping step exists in the IDM-VTON pipeline (the
             # garment is conditioned into the UNet via IP-Adapter/unet_encoder, not
             # via a separate warp module), so there is no discrete "warped garment"
             # image to export here.
-            _save_debug_image(result, debug_dir / "06_final_output.jpg", "final output image")
+            _save_debug_image(result, debug_dir / "06_final_output.jpg",
+                               "final output image (original size restored)")
             logger.info("[DEBUG_VISUALIZATION] debug images for job %s saved to %s", job_id, debug_dir)
         return output_path
 
