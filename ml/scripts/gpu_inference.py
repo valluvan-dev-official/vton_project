@@ -24,6 +24,7 @@ import cv2
 from PIL import Image
 
 from letterbox_geometry import LetterboxTransform, compute_letterbox_geometry
+from mask_gap_correction import correct_agnostic_mask_gap, scale_keypoints
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,26 @@ class GPUInferenceEngine:
         # NEAREST: `mask` is a binary/label image — smooth resampling would
         # blur 0/255 edges into intermediate gray values.
         mask = mask.resize((SIZE_W, SIZE_H), Image.NEAREST)
+
+        # ── Remove parser-confirmed background wrongly bridged into the mask ──
+        # get_mask_location()'s dilated shoulder-elbow-wrist arm line can cross
+        # the empty background next to a bent elbow, marking real background as
+        # "editable" — IDM-VTON then paints garment fabric into that gap. This
+        # removes only that specific enclosed component per arm; clothes,
+        # actual arm pixels, and valid outward sleeve space are untouched.
+        parse_np_full = np.array(parse_result.resize((SIZE_W, SIZE_H), Image.NEAREST))
+        sx, sy = SIZE_W / float(PARSE_W), SIZE_H / float(PARSE_H)
+        scaled_keypoints = scale_keypoints(keypoints, sx, sy)
+        corrected_np, gap_diag, gap_debug_np = correct_agnostic_mask_gap(
+            parse_np_full, np.array(mask), scaled_keypoints
+        )
+        mask = Image.fromarray(corrected_np)
+
+        if debug_dir is not None:
+            _save_debug_image(gap_debug_np, debug_dir / "04a_detected_arm_torso_gaps.png",
+                               "detected bent-arm/torso background gap components")
+            _save_debug_image(mask, debug_dir / "04b_corrected_agnostic_mask.png",
+                               "agnostic mask after arm/torso gap correction")
 
         # For half-sleeve garments, remove arm regions from mask so arms stay visible.
         # For full-sleeve garments, keep mask intact so sleeves cover the arms correctly.
