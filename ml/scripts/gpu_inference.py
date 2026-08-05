@@ -25,6 +25,7 @@ from PIL import Image
 
 from letterbox_geometry import LetterboxTransform, compute_letterbox_geometry
 from mask_gap_correction import correct_agnostic_mask_gap, scale_keypoints
+from collar_mask_correction import correct_collar_mask
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +299,26 @@ class GPUInferenceEngine:
                                "detected bent-arm/torso background gap components")
             _save_debug_image(mask, debug_dir / "04b_corrected_agnostic_mask.png",
                                "agnostic mask after arm/torso gap correction")
+
+        # ── Add leftover original-garment pixels around the neckline/collar ──
+        # The base mask sometimes leaves a thin band of the old T-shirt visible
+        # directly below the neck / between the shoulders (especially with dark
+        # garments), which then shows through the newly generated collar. This
+        # adds only that specific leftover band; it never touches background,
+        # arm, or neck-skin pixels, and is a separate, independent correction
+        # from the arm/torso-gap fix above.
+        collar_corrected_np, collar_candidate_np, collar_protection_np, collar_diag = correct_collar_mask(
+            parse_np_full, np.array(mask), scaled_keypoints
+        )
+        mask = Image.fromarray(collar_corrected_np)
+
+        if debug_dir is not None:
+            _save_debug_image(collar_candidate_np, debug_dir / "04c_detected_collar_region.png",
+                               "raw garment-labelled collar candidate (before protection)")
+            _save_debug_image(collar_protection_np, debug_dir / "04d_collar_protection_mask.png",
+                               "protected pixels excluded from collar correction")
+            _save_debug_image(mask, debug_dir / "04e_final_corrected_agnostic_mask.png",
+                               "agnostic mask after arm-gap and collar correction")
 
         # For half-sleeve garments, remove arm regions from mask so arms stay visible.
         # For full-sleeve garments, keep mask intact so sleeves cover the arms correctly.
