@@ -43,6 +43,7 @@ services:
       DEVICE: cuda
       WEIGHTS_DIR: /app/ml/weights
       WORKSPACE: /tmp/vton_workspace
+      DEBUG_VISUALIZATION: ${DEBUG_VISUALIZATION:-false}
     volumes:
       # Bind-mount the entire ml/ tree so scripts, configs, and weights are
       # all available under /app/ml inside the container.
