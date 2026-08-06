@@ -343,6 +343,42 @@
     statusBar.classList.remove('visible');
   }
 
+  function formatApiErrorBody(body) {
+    if (body === undefined || body === null) return undefined;
+    if (typeof body === 'string') return body;
+    if (Array.isArray(body)) {
+      return body
+        .map(item => typeof item === 'string' ? item : formatApiErrorBody(item))
+        .filter(Boolean)
+        .join('; ');
+    }
+    if (typeof body === 'object') {
+      if (body.detail !== undefined) return formatApiErrorBody(body.detail);
+      if (body.message !== undefined) return formatApiErrorBody(body.message);
+      if (body.error_message !== undefined) return formatApiErrorBody(body.error_message);
+      if (body.loc && body.msg) {
+        const loc = Array.isArray(body.loc) ? body.loc.join('.') : body.loc;
+        return `${loc}: ${body.msg}`;
+      }
+      try {
+        return JSON.stringify(body, null, 2);
+      } catch {
+        return String(body);
+      }
+    }
+    return String(body);
+  }
+
+  async function parseErrorResponse(res) {
+    const text = await res.text();
+    if (!text) return undefined;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+
   btnSubmit.addEventListener('click', async () => {
     errorBox.classList.remove('visible');
     resultSec.classList.remove('visible');
@@ -362,13 +398,26 @@
     try {
       const res = await fetch('/api/v1/tryon', { method: 'POST', body: fd });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || 'Submission failed');
+        const body = await parseErrorResponse(res);
+        const msg = formatApiErrorBody(body) || res.statusText || 'Submission failed';
+        console.error('Try-on submission failed', {
+          url: '/api/v1/tryon',
+          status: res.status,
+          statusText: res.statusText,
+          body,
+          headers: {
+            'content-type': res.headers.get('content-type'),
+          },
+        });
+        const error = new Error(msg);
+        error.status = res.status;
+        throw error;
       }
       const data = await res.json();
       jobId = data.job_id;
     } catch (e) {
-      showError('Submission failed: ' + e.message);
+      const statusPart = e.status ? ` (${e.status})` : '';
+      showError('Submission failed' + statusPart + ': ' + e.message);
       btnSubmit.disabled = false;
       return;
     }
