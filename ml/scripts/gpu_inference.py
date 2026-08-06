@@ -332,7 +332,7 @@ class GPUInferenceEngine:
         if debug_dir is not None:
             _save_debug_image(mask, debug_dir / "04_agnostic_mask.png", "agnostic mask")
 
-        return agnostic, mask, keypoints
+        return agnostic, mask, keypoints, parse_result
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
@@ -365,7 +365,7 @@ class GPUInferenceEngine:
                                "letterboxed person image (pipeline input)")
 
         # ── Step 1: Human parse + agnostic mask ──
-        agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(person_pil, garment_pil, debug_dir=debug_dir)
+        agnostic_pil, mask_pil, keypoints, parse_result = self._get_agnostic_mask(person_pil, garment_pil, debug_dir=debug_dir)
 
         # ── Step 2: Prepare tensors ──
         pose_img       = self._render_pose_image(keypoints, SIZE_W, SIZE_H)
@@ -424,10 +424,26 @@ class GPUInferenceEngine:
                 guidance_scale=2.5,
             )[0]
 
-        # ── Step 5: Save result ──
+        # ── Step 5: Restore face + hair from original person ──
+        # IDM-VTON regenerates the entire masked region including face/neck
+        # boundary. We paste back the face and hair pixels from the original
+        # letterboxed person image so identity is preserved.
+        parse_full = np.array(parse_result.resize((SIZE_W, SIZE_H), Image.NEAREST))
+        # SCHP labels: 2=Hair, 11=Face
+        restore_mask = np.isin(parse_full, [2, 11]).astype(np.uint8) * 255
+        # Smooth edges for natural blending
+        restore_mask = cv2.GaussianBlur(restore_mask, (21, 21), 0)
+        alpha = restore_mask.astype(np.float32) / 255.0
+        result_np   = np.array(images[0]).astype(np.float32)
+        original_np = np.array(person_pil).astype(np.float32)
+        alpha3 = alpha[:, :, np.newaxis]
+        blended = original_np * alpha3 + result_np * (1 - alpha3)
+        result_img = Image.fromarray(blended.astype(np.uint8))
+
+        # ── Step 6: Save result ──
         # Crop the letterbox padding back out and restore the exact original
         # person-image dimensions (undoes Step 0).
-        result = _unletterbox_image(images[0], letterbox_transform)
+        result = _unletterbox_image(result_img, letterbox_transform)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path, "JPEG", quality=95)
         logger.info("IDM-VTON result saved: %s (restored to original %dx%d)",
