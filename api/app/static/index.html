@@ -453,11 +453,20 @@
           setProgress(100, 'Done!', '');
 
           // Show result
-          resultOutput.src = data.result_url + '?t=' + Date.now();
-          btnDownload.href = data.result_url;
+          const resultUrl = `/api/v1/result/${jobId}?t=${Date.now()}`;
+
+          resultOutput.onload = () => {
+            resultSec.classList.add('visible');
+          };
+          resultOutput.onerror = () => {
+            showError('The try-on completed, but the result image could not be displayed.');
+            btnSubmit.disabled = false;
+          };
+
+          resultOutput.src = resultUrl;
+          btnDownload.href = `/api/v1/result/${jobId}`;
           document.getElementById('result-person').src  = URL.createObjectURL(personFile);
-          document.getElementById('result-garment').src = URL.createObjectURL(garmentFile);
-          resultSec.classList.add('visible');
+          document.getElementById('result-garment').src = URL.createObjectURL(garmentFiles[0]);
           btnSubmit.disabled = false;
         } else if (st === 'failed') {
           clearInterval(pollInterval);
