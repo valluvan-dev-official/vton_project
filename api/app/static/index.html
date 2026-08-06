@@ -193,6 +193,31 @@
     }
     .error-box.visible { display: block; }
 
+    /* Fit estimate (Phase 1, optional/additive) */
+    .fit-card {
+      background: #161616; border: 1px solid #2a2a2a; border-radius: 12px; padding: 16px 20px;
+    }
+    .fit-summary { cursor: pointer; font-size: 0.9rem; font-weight: 600; color: #ccc; }
+    .fit-body { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+    .fit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+    .fit-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 0.75rem; color: #999; }
+    .fit-grid input {
+      background: #0f0f0f; color: #e8e8e8; border: 1px solid #333; border-radius: 8px;
+      padding: 8px 10px; font-size: 0.85rem;
+    }
+    .btn-fit {
+      align-self: flex-start; padding: 8px 16px; background: #1a1a1a; border: 1px solid #3a8a5c;
+      border-radius: 8px; color: #3dbb6d; font-size: 0.82rem; font-weight: 600; cursor: pointer;
+    }
+    .btn-fit:hover { background: #0d2a1a; }
+    .btn-fit:disabled { opacity: 0.5; cursor: not-allowed; }
+    .fit-result { font-size: 0.82rem; color: #ccc; display: none; }
+    .fit-result.visible { display: block; }
+    .fit-result .fit-shape { font-weight: 700; color: #3dbb6d; }
+    .fit-result table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    .fit-result td, .fit-result th { padding: 4px 8px; text-align: left; font-size: 0.78rem; border-bottom: 1px solid #222; }
+    .fit-disclaimer { font-size: 0.68rem; color: #555; }
+
     @media (max-width: 600px) {
       .upload-row { grid-template-columns: 1fr; }
       .result-grid { grid-template-columns: 1fr 1fr; }
@@ -238,6 +263,24 @@
     </select>
     <span class="size-hint">Person's size is detected automatically from the photo.</span>
   </div>
+
+  <!-- Body-shape / fit estimate (Phase 1, optional, additive) — does not
+       affect the try-on flow above; it's a separate, independent request. -->
+  <details class="fit-card" id="fit-card">
+    <summary class="fit-summary">Body measurements &amp; fit estimate (optional)</summary>
+    <div class="fit-body">
+      <div class="fit-grid">
+        <label>Height (cm)<input type="number" id="fit-height" min="100" max="250" /></label>
+        <label>Bust (cm)<input type="number" id="fit-bust" min="40" max="200" /></label>
+        <label>Waist (cm)<input type="number" id="fit-waist" min="40" max="200" /></label>
+        <label>Hips (cm)<input type="number" id="fit-hips" min="40" max="200" /></label>
+        <label>Shoulder (cm, optional)<input type="number" id="fit-shoulder" min="20" max="70" /></label>
+      </div>
+      <button class="btn-fit" id="btn-fit-estimate" type="button">Check fit</button>
+      <div class="fit-result" id="fit-result"></div>
+      <div class="fit-disclaimer">AI fit estimate — actual fit may vary by brand, fabric and garment construction.</div>
+    </div>
+  </details>
 
   <button class="btn-tryon" id="btn-submit" disabled>Try On →</button>
 
@@ -378,6 +421,69 @@
       return text;
     }
   }
+
+  // ── Body-shape / fit estimate (Phase 1, optional, additive) ──────────────
+  // Fully independent of the try-on submit flow above: separate button,
+  // separate request, separate result area. Leaving all fields blank and
+  // never pressing "Check fit" leaves the existing try-on flow untouched.
+  const btnFit    = document.getElementById('btn-fit-estimate');
+  const fitResult = document.getElementById('fit-result');
+
+  function num(id) {
+    const v = document.getElementById(id).value;
+    return v === '' ? null : Number(v);
+  }
+
+  btnFit.addEventListener('click', async () => {
+    fitResult.classList.remove('visible');
+    btnFit.disabled = true;
+    btnFit.textContent = 'Checking...';
+
+    const body = {
+      height_cm: num('fit-height'),
+      bust_cm: num('fit-bust'),
+      waist_cm: num('fit-waist'),
+      hips_cm: num('fit-hips'),
+      shoulder_cm: num('fit-shoulder'),
+    };
+
+    try {
+      const res = await fetch('/api/v1/fit/estimate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          body,
+          selected_size: document.getElementById('select-garment-size').value,
+          garment_measurements: [],
+        }),
+      });
+      const parsed = await parseErrorResponse(res);
+      if (!res.ok) {
+        const msg = formatApiErrorBody(parsed) || res.statusText || 'Fit estimate failed';
+        console.error('Fit estimate failed', { url: '/api/v1/fit/estimate', status: res.status, body: parsed });
+        fitResult.textContent = `Fit estimate failed (${res.status}): ${msg}`;
+        fitResult.classList.add('visible');
+        return;
+      }
+      const data = parsed;
+      const rows = Object.entries(data.regional_fit || {})
+        .map(([region, r]) => `<tr><td>${region}</td><td>${r.ease_cm ?? '—'}</td><td>${r.fit}</td></tr>`)
+        .join('');
+      fitResult.innerHTML = `
+        <div>Body shape: <span class="fit-shape">${data.body_shape}</span> (confidence ${data.confidence})</div>
+        <div>Recommended size: <strong>${data.recommended_size ?? 'insufficient data'}</strong></div>
+        <div>${data.summary}</div>
+        <table><thead><tr><th>Region</th><th>Ease (cm)</th><th>Fit</th></tr></thead><tbody>${rows}</tbody></table>
+      `;
+      fitResult.classList.add('visible');
+    } catch (e) {
+      fitResult.textContent = 'Fit estimate failed: ' + e.message;
+      fitResult.classList.add('visible');
+    } finally {
+      btnFit.disabled = false;
+      btnFit.textContent = 'Check fit';
+    }
+  });
 
   btnSubmit.addEventListener('click', async () => {
     errorBox.classList.remove('visible');
