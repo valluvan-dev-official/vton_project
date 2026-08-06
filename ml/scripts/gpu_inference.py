@@ -557,7 +557,7 @@ class GPUInferenceEngine:
                                "letterboxed person image (pipeline input)")
 
         # ── Step 1: Human parse + agnostic mask ──
-        agnostic_pil, mask_pil, keypoints = self._get_agnostic_mask(
+        agnostic_pil, mask_pil, keypoints, parse_result = self._get_agnostic_mask(
             person_pil, garment_pil, garment_size=garment_size, debug_dir=debug_dir,
         )
         person_size = self.last_person_size_estimate
