@@ -58,6 +58,14 @@
       transition: border-color 0.2s, background 0.2s;
       position: relative;
     }
+    .size-row { display: flex; align-items: center; gap: 10px; }
+    .size-row label { font-size: 0.85rem; color: #aaa; }
+    .size-row select {
+      background: #161616; color: #e8e8e8; border: 1px solid #333;
+      border-radius: 8px; padding: 6px 10px; font-size: 0.85rem;
+    }
+    .size-hint { font-size: 0.75rem; color: #666; }
+
     .upload-card:hover { border-color: #555; background: #1c1c1c; }
     .upload-card.has-image { border-style: solid; border-color: #3a8a5c; }
 
@@ -211,12 +219,24 @@
     </div>
 
     <div class="upload-card" id="card-garment">
-      <input type="file" id="input-garment" accept="image/jpeg,image/png" />
+      <input type="file" id="input-garment" accept="image/jpeg,image/png" multiple />
       <div class="upload-icon">👕</div>
-      <div class="upload-label">Garment Photo</div>
-      <div class="upload-hint">Shirt / Kurta · JPG/PNG · max 10MB</div>
+      <div class="upload-label">Garment Photos</div>
+      <div class="upload-hint">Same garment, multiple angles · JPG/PNG · max 10MB each, up to 6</div>
       <img class="preview-img" id="preview-garment" alt="garment preview" />
     </div>
+  </div>
+
+  <div class="size-row">
+    <label for="select-garment-size">Garment size</label>
+    <select id="select-garment-size">
+      <option value="S">S</option>
+      <option value="M" selected>M</option>
+      <option value="L">L</option>
+      <option value="XL">XL</option>
+      <option value="XXL">XXL</option>
+    </select>
+    <span class="size-hint">Person's size is detected automatically from the photo.</span>
   </div>
 
   <button class="btn-tryon" id="btn-submit" disabled>Try On →</button>
@@ -278,7 +298,7 @@
   const resultOutput = document.getElementById('result-output');
   const btnDownload  = document.getElementById('btn-download');
 
-  let personFile = null, garmentFile = null;
+  let personFile = null, garmentFiles = [];
   let pollInterval = null;
 
   function previewFile(file, imgEl, cardEl) {
@@ -297,13 +317,13 @@
   });
 
   inputGarment.addEventListener('change', e => {
-    garmentFile = e.target.files[0];
-    if (garmentFile) previewFile(garmentFile, previewG, cardGarment);
+    garmentFiles = Array.from(e.target.files || []);
+    if (garmentFiles.length) previewFile(garmentFiles[0], previewG, cardGarment);
     checkReady();
   });
 
   function checkReady() {
-    btnSubmit.disabled = !(personFile && garmentFile);
+    btnSubmit.disabled = !(personFile && garmentFiles.length);
   }
 
   function setBadge(status) {
@@ -334,8 +354,9 @@
     setProgress(5, 'Uploading images...', 'Estimated time: ~3 minutes');
 
     const fd = new FormData();
-    fd.append('person_image',  personFile);
-    fd.append('garment_image', garmentFile);
+    fd.append('person_image', personFile);
+    garmentFiles.forEach(f => fd.append('garment_images', f));
+    fd.append('garment_size', document.getElementById('select-garment-size').value);
 
     let jobId;
     try {

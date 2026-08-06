@@ -2,8 +2,11 @@
 Celery tasks for async try-on job processing.
 
 Flow:
-  1. Download person + garment from S3 to temp local files
-  2. Run GPU inference (GPUInferenceEngine singleton)
+  1. Download person + garment(s) from S3 to temp local files
+  2. Run inference via InferenceRouter — IDM-VTON, own trained model, or
+     placeholder, whichever OWN_MODEL_CHECKPOINT / DEVICE / WEIGHTS_DIR
+     selects (see app/services/inference.py). Swapping models is therefore
+     a config change, not a code change.
   3. Upload result to S3
   4. Calculate SSIM quality score
   5. If score >= MIN_QUALITY_SCORE → auto-save as training pair + update pairs.json
@@ -28,8 +31,7 @@ from skimage.metrics import structural_similarity as ssim
 import numpy as np
 
 from app.config import get_settings
-# [SAGEMAKER] from app.services.inference import get_inference_router  # re-enable for SageMaker
-import app.services.gpu_inference_service as _gpu_svc
+from app.services.inference import get_inference_router
 from app.services.storage import get_storage
 
 settings = get_settings()
@@ -182,7 +184,8 @@ def _resolve_local_path(s3_key_or_path: str, job_id: str, role: str) -> str:
 # ── Main Celery task ──────────────────────────────────────────────────────────
 
 @celery_app.task(bind=True, name="tasks.process_tryon_job", max_retries=2)
-def process_tryon_job(self, job_id: str, person_image_path: str, garment_image_path: str):
+def process_tryon_job(self, job_id: str, person_image_path: str,
+                       garment_image_paths, garment_size: str = "M"):
     """
     Main try-on pipeline:
       1. Resolve input images (download from S3 if needed)
@@ -196,6 +199,11 @@ def process_tryon_job(self, job_id: str, person_image_path: str, garment_image_p
     logger = logging.getLogger(__name__)
     tmp_files: list[str] = []   # track temp files to clean up
 
+    # Backward-compat: accept a single string path (old callers/tests) as
+    # well as the new list-of-paths (multiple garment angles).
+    if isinstance(garment_image_paths, str):
+        garment_image_paths = [garment_image_paths]
+
     try:
         _update_job(job_id, {"status": "processing"})
 
@@ -204,20 +212,32 @@ def process_tryon_job(self, job_id: str, person_image_path: str, garment_image_p
         tmp_dir = Path(settings.LOCAL_STORAGE_PATH) / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        local_person  = _resolve_local_path(person_image_path,  job_id, "person")
-        local_garment = _resolve_local_path(garment_image_path, job_id, "garment")
+        local_person = _resolve_local_path(person_image_path, job_id, "person")
+        local_garments = [
+            _resolve_local_path(p, job_id, f"garment{i}")
+            for i, p in enumerate(garment_image_paths)
+        ]
 
         # Track any temp files created by _resolve_local_path
-        for p in (local_person, local_garment):
+        for p in [local_person, *local_garments]:
             if str(tmp_dir) in p:
                 tmp_files.append(p)
 
         # ── 2. Inference ──────────────────────────────────────────────────
         output_path = str(tmp_dir / f"{job_id}_output.jpg")
-        logger.info("tasks: Starting inference for job %s...", job_id)
-        _gpu_svc.run(local_person, local_garment, output_path, job_id=job_id)
-        # [SAGEMAKER] router = get_inference_router(); router.run(...)  # re-enable for SageMaker
-        logger.info("tasks: Inference complete for job %s.", job_id)
+        logger.info(
+            "tasks: Starting inference for job %s (%d garment image(s), garment_size=%s)...",
+            job_id, len(local_garments), garment_size,
+        )
+        router = get_inference_router()
+        router.run(
+            local_person, local_garments, output_path, job_id=job_id, garment_size=garment_size,
+        )
+        person_size_estimate = router.last_person_size_estimate
+        logger.info(
+            "tasks: Inference complete for job %s (person_size_estimate=%s).",
+            job_id, person_size_estimate,
+        )
 
         # ── 3. Upload result to S3 ────────────────────────────────────────
         result_s3_key = f"{settings.S3_PREFIX_OUTPUT}/{job_id}.jpg"
@@ -236,15 +256,16 @@ def process_tryon_job(self, job_id: str, person_image_path: str, garment_image_p
         # ── 5. Training pair auto-save ────────────────────────────────────
         saved = False
         if score >= settings.MIN_QUALITY_SCORE:
-            _save_training_pair(job_id, local_person, local_garment, output_path, score)
+            _save_training_pair(job_id, local_person, local_garments[0], output_path, score)
             saved = True
 
         # ── 6. Mark completed ─────────────────────────────────────────────
         _update_job(job_id, {
-            "status":            "completed",
-            "result_image_path": result_image_path,
-            "quality_score":     score,
-            "saved_as_training": saved,
+            "status":               "completed",
+            "result_image_path":    result_image_path,
+            "quality_score":        score,
+            "saved_as_training":    saved,
+            "person_size_estimate": person_size_estimate,
         })
 
     except Exception as exc:

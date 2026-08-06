@@ -82,11 +82,15 @@ class TestInferencePlaceholder:
         router = InferenceRouter()
         assert router.use_own_model is False
 
-    def test_switch_to_own_model_raises_not_implemented(self):
+    def test_switch_to_own_model_with_bad_checkpoint_raises(self):
+        """_load_model now actually loads a VTONPipeline checkpoint (ml/src/inference/infer.py)
+        instead of stubbing with NotImplementedError — a missing/invalid checkpoint path
+        should still fail, just via the real loader's own error, not a stub."""
         from api.app.services.inference import InferenceRouter
         router = InferenceRouter()
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(Exception):
             router.switch_to_own_model("nonexistent.pt")
+        assert router.use_own_model is False
 
 
 # ── TC-003 / TC-004 / TC-005  Route validation ────────────────────────────────
