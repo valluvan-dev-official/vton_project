@@ -26,6 +26,7 @@ from PIL import Image
 from letterbox_geometry import LetterboxTransform, compute_letterbox_geometry
 from mask_gap_correction import correct_agnostic_mask_gap, scale_keypoints
 from collar_mask_correction import correct_collar_mask
+from garment_color_transfer import apply_garment_color_transfer
 
 logger = logging.getLogger(__name__)
 
@@ -192,8 +193,15 @@ class GPUInferenceEngine:
         )
         image_encoder.requires_grad_(False)
 
+        # VAE stays in float32 — SDXL's VAE is numerically unstable in fp16
+        # (a well-documented issue: saturated colors, red in particular, can
+        # decode with a hue shift toward brown/olive/green). Loading it here
+        # in fp32 and never recasting it (the .to(self.device) call below is
+        # device-only, no dtype arg) keeps every VAE encode/decode in fp32
+        # while the UNet/text-encoders stay fp16 for speed. This is the
+        # standard fix for this exact SDXL-family color-drift symptom.
         vae = AutoencoderKL.from_pretrained(
-            base, subfolder="vae", torch_dtype=torch.float16
+            base, subfolder="vae", torch_dtype=torch.float32
         )
 
         self._pipe = TryonPipeline.from_pretrained(
@@ -385,6 +393,16 @@ class GPUInferenceEngine:
                 return label
         return "XXL"
 
+    # Per-size-step delta and the clamp on the resulting multiplier. Previously
+    # 0.06/step (clamped to 0.75-1.35) — a 1-step difference only moved the
+    # mask-dilation kernel by ~2px (see _get_agnostic_mask below), which
+    # diffusion regeneration smoothed away entirely, making S/M/L/XL outputs
+    # visually indistinguishable. Raised so a single size step is actually
+    # visible while an extreme (XS<->XL) request still stays within a
+    # plausible garment-fit range rather than distorting past recognizability.
+    FIT_STEP_DELTA = 0.14
+    FIT_FACTOR_MIN, FIT_FACTOR_MAX = 0.55, 1.65
+
     def _fit_scale_factor(self, person_size: str, garment_size: str) -> float:
         """Combine detected person size + requested garment size into a scale
         multiplier: an L garment on an M person should sit looser/larger than
@@ -393,8 +411,8 @@ class GPUInferenceEngine:
         g_idx = SIZE_ORDER.index(garment_size) if garment_size in SIZE_ORDER else p_idx
 
         diff = g_idx - p_idx
-        factor = 1.0 + diff * 0.06  # ~6% garment growth per size step
-        return max(0.75, min(factor, 1.35))
+        factor = 1.0 + diff * self.FIT_STEP_DELTA
+        return max(self.FIT_FACTOR_MIN, min(factor, self.FIT_FACTOR_MAX))
 
     # ── Agnostic mask ─────────────────────────────────────────────────────────
 
@@ -464,7 +482,11 @@ class GPUInferenceEngine:
         # actually sit versus the detected body size.
         fit_factor = self._fit_scale_factor(self.last_person_size_estimate, garment_size)
         if abs(fit_factor - 1.0) > 1e-3:
-            kernel_px = int(round(abs(fit_factor - 1.0) * 40))  # ~40px per 100% delta
+            # 160px per 100% delta (was 40px — a single size step only moved
+            # this by ~2px, invisible after 30 diffusion steps smoothed it
+            # away). Capped at 90px so an extreme multi-step request dilates/
+            # erodes the repaint region without spilling into hair/background.
+            kernel_px = min(int(round(abs(fit_factor - 1.0) * 160)), 90)
             if kernel_px > 0:
                 kernel = np.ones((kernel_px, kernel_px), np.uint8)
                 mask_np = np.array(mask)
@@ -579,7 +601,10 @@ class GPUInferenceEngine:
                 # an L garment on an M person should render bigger/looser than
                 # an M garment on the same person, and vice versa.
                 scale *= self._fit_scale_factor(person_size, garment_size)
-                scale = max(0.65, min(scale, 1.45))  # clamp: avoid extreme scaling
+                # Clamp widened to match the stronger FIT_FACTOR range above —
+                # the previous 0.65-1.45 clamp was quietly capping the size
+                # signal at the extremes before it reached the diffusion model.
+                scale = max(0.55, min(scale, 1.65))
                 new_w = int(SIZE_W * scale)
                 new_h = int(SIZE_H * scale)
                 garment_scaled = garment_pil.resize((new_w, new_h), Image.LANCZOS)
@@ -663,16 +688,42 @@ class GPUInferenceEngine:
                 image=person_pil,
                 height=SIZE_H,
                 width=SIZE_W,
-                guidance_scale=2.5,
+                # Raised from 2.5: at that low a CFG scale the model's learned
+                # "normal fit" prior tended to dominate over the mask-shape/
+                # garment-scale conditioning that's supposed to carry the
+                # size signal. 3.5 is still well below typical SDXL defaults
+                # (5-9) to avoid over-driving general image quality — this is
+                # the one change here most worth re-checking visually on the
+                # GPU box, since it affects overall output, not just sizing.
+                guidance_scale=3.5,
                 **ip_adapter_kwargs,
             )[0]
 
-        # ── Step 5: Undo letterbox padding, restore original aspect ratio, save ──
+        # ── Step 4b: Color-correct the repainted region ──
+        # The VAE fp32 fix above (see _load_idm_pipeline) addresses the main
+        # cause of hue drift, but diffusion-reproduced color is never
+        # guaranteed pixel-exact to the source garment. This is a safety
+        # net: pull the repainted region's color statistics back toward the
+        # true source-garment photo, restricted to the mask so background/
+        # skin/hair pixels are never touched. Pure numpy/cv2 — see
+        # garment_color_transfer.py (unit tested independently of the GPU
+        # pipeline).
         result = images[0]
 
         if debug_dir is not None:
-            _save_debug_image(result, debug_dir / "05_raw_pipeline_output.jpg",
-                               "pipeline output before un-letterboxing")
+            _save_debug_image(result, debug_dir / "05a_raw_pipeline_output.jpg",
+                               "pipeline output before color correction")
+
+        result_np = np.array(result.convert("RGB"))
+        mask_np = np.array(mask_pil.resize(result.size, Image.NEAREST))
+        reference_np = np.array(garment_orig)  # original, un-padded source photo — truest color
+        result_np = apply_garment_color_transfer(result_np, mask_np, reference_np, strength=0.85)
+        result = Image.fromarray(result_np)
+
+        # ── Step 5: Undo letterbox padding, restore original aspect ratio, save ──
+        if debug_dir is not None:
+            _save_debug_image(result, debug_dir / "05b_color_corrected_output.jpg",
+                               "pipeline output after color correction")
 
         result = _unletterbox_image(result, letterbox_transform)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
