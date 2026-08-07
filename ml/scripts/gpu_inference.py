@@ -193,15 +193,17 @@ class GPUInferenceEngine:
         )
         image_encoder.requires_grad_(False)
 
-        # VAE stays in float32 — SDXL's VAE is numerically unstable in fp16
-        # (a well-documented issue: saturated colors, red in particular, can
-        # decode with a hue shift toward brown/olive/green). Loading it here
-        # in fp32 and never recasting it (the .to(self.device) call below is
-        # device-only, no dtype arg) keeps every VAE encode/decode in fp32
-        # while the UNet/text-encoders stay fp16 for speed. This is the
-        # standard fix for this exact SDXL-family color-drift symptom.
+        # NOTE: an fp32-VAE load was tried here as the "textbook" fix for
+        # SDXL's fp16 VAE color-drift, but reverted — IDM-VTON's tryon_pipeline
+        # is a custom fork (git-cloned at container startup, not vendored in
+        # this repo) and its decode path isn't known to upcast tensors around
+        # a mixed-dtype VAE, which caused a hard crash (silently caught by
+        # inference.py's fallback, producing the placeholder image instead of
+        # a real result). Color correction is now handled entirely by the
+        # post-generation garment_color_transfer step below instead, which
+        # doesn't depend on pipeline-internal dtype handling.
         vae = AutoencoderKL.from_pretrained(
-            base, subfolder="vae", torch_dtype=torch.float32
+            base, subfolder="vae", torch_dtype=torch.float16
         )
 
         self._pipe = TryonPipeline.from_pretrained(
