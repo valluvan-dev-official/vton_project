@@ -193,17 +193,16 @@ class GPUInferenceEngine:
         )
         image_encoder.requires_grad_(False)
 
-        # NOTE: an fp32-VAE load was tried here as the "textbook" fix for
-        # SDXL's fp16 VAE color-drift, but reverted — IDM-VTON's tryon_pipeline
-        # is a custom fork (git-cloned at container startup, not vendored in
-        # this repo) and its decode path isn't known to upcast tensors around
-        # a mixed-dtype VAE, which caused a hard crash (silently caught by
-        # inference.py's fallback, producing the placeholder image instead of
-        # a real result). Color correction is now handled entirely by the
-        # post-generation garment_color_transfer step below instead, which
-        # doesn't depend on pipeline-internal dtype handling.
+        # RE-ENABLED for a controlled test (previously reverted once — see
+        # git history — after it crashed and fell back to the placeholder
+        # image). Re-enabling now, isolated from the LAB color-transfer step
+        # (disabled below), specifically to determine whether fp32 VAE alone
+        # fixes the color drift without the pattern-destroying side effect
+        # LAB transfer had. If this crashes again, that confirms the VAE
+        # dtype change itself is incompatible with this pipeline fork,
+        # independent of the LAB transfer question.
         vae = AutoencoderKL.from_pretrained(
-            base, subfolder="vae", torch_dtype=torch.float16
+            base, subfolder="vae", torch_dtype=torch.float32
         )
 
         self._pipe = TryonPipeline.from_pretrained(
@@ -701,32 +700,29 @@ class GPUInferenceEngine:
                 **ip_adapter_kwargs,
             )[0]
 
-        # ── Step 4b: Color-correct the repainted region ──
-        # The VAE fp32 fix above (see _load_idm_pipeline) addresses the main
-        # cause of hue drift, but diffusion-reproduced color is never
-        # guaranteed pixel-exact to the source garment. This is a safety
-        # net: pull the repainted region's color statistics back toward the
-        # true source-garment photo, restricted to the mask so background/
-        # skin/hair pixels are never touched. Pure numpy/cv2 — see
-        # garment_color_transfer.py (unit tested independently of the GPU
-        # pipeline).
+        # ── Step 4b: Color-correct the repainted region — TEMPORARILY DISABLED ──
+        # Controlled test in progress: the LAB color-transfer step below
+        # (garment_color_transfer.apply_garment_color_transfer) was found to
+        # wash out patterned/textured garments — its reference-color
+        # statistics exclude near-white pixels (e.g. a gingham's white
+        # squares), then impose that narrow, single-color statistic across
+        # the ENTIRE masked region, collapsing light/dark pattern contrast
+        # toward one flat tone. Confirmed on a navy/white check shirt: the
+        # checks disappeared, output went pale blue-gray.
+        #
+        # Disabled here (not deleted — the module and its tests still exist
+        # and pass) so this run isolates fp32 VAE alone as the color fix
+        # under test. Do not re-enable without first making it pattern-safe
+        # (e.g. skip correction when the reference garment's own color
+        # variance is high, or match mean only — not mean+std — so local
+        # contrast survives).
         result = images[0]
 
         if debug_dir is not None:
-            _save_debug_image(result, debug_dir / "05a_raw_pipeline_output.jpg",
-                               "pipeline output before color correction")
-
-        result_np = np.array(result.convert("RGB"))
-        mask_np = np.array(mask_pil.resize(result.size, Image.NEAREST))
-        reference_np = np.array(garment_orig)  # original, un-padded source photo — truest color
-        result_np = apply_garment_color_transfer(result_np, mask_np, reference_np, strength=0.85)
-        result = Image.fromarray(result_np)
+            _save_debug_image(result, debug_dir / "05_raw_pipeline_output.jpg",
+                               "pipeline output (color transfer disabled for this test)")
 
         # ── Step 5: Undo letterbox padding, restore original aspect ratio, save ──
-        if debug_dir is not None:
-            _save_debug_image(result, debug_dir / "05b_color_corrected_output.jpg",
-                               "pipeline output after color correction")
-
         result = _unletterbox_image(result, letterbox_transform)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         result.save(output_path, "JPEG", quality=95)
