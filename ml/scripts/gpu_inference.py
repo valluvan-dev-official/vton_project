@@ -479,15 +479,19 @@ class GPUInferenceEngine:
                 return label
         return "XXL"
 
-    # Per-size-step delta and the clamp on the resulting multiplier. Previously
-    # 0.06/step (clamped to 0.75-1.35) — a 1-step difference only moved the
-    # mask-dilation kernel by ~2px (see _get_agnostic_mask below), which
-    # diffusion regeneration smoothed away entirely, making S/M/L/XL outputs
-    # visually indistinguishable. Raised so a single size step is actually
-    # visible while an extreme (XS<->XL) request still stays within a
-    # plausible garment-fit range rather than distorting past recognizability.
-    FIT_STEP_DELTA = 0.14
-    FIT_FACTOR_MIN, FIT_FACTOR_MAX = 0.55, 1.65
+    # REVERTED (regression from commit 58e8fa7 "fix:gaments colour &
+    # transfer"): that commit raised these to 0.14 / (0.55-1.65), which
+    # combined with the *uncapped-in-effect* 160px/100% mask-erosion kernel
+    # below produced a ~67px erosion kernel for any large person/garment
+    # size mismatch (e.g. detected XXL person + requested M garment). That
+    # erodes away nearly the entire agnostic/inpainting mask, and since the
+    # SDXL inpaint denoising loop blends the ORIGINAL image back in wherever
+    # the mask is 0 at every step, an eroded-to-near-nothing mask means the
+    # output stays almost entirely the original garment (e.g. a white shirt)
+    # regardless of what the diffusion model would otherwise paint. Back to
+    # the known-good 0.06/step, clamped to 0.75-1.35.
+    FIT_STEP_DELTA = 0.06
+    FIT_FACTOR_MIN, FIT_FACTOR_MAX = 0.75, 1.35
 
     def _fit_scale_factor(self, person_size: str, garment_size: str) -> float:
         """Combine detected person size + requested garment size into a scale
@@ -568,11 +572,10 @@ class GPUInferenceEngine:
         # actually sit versus the detected body size.
         fit_factor = self._fit_scale_factor(self.last_person_size_estimate, garment_size)
         if abs(fit_factor - 1.0) > 1e-3:
-            # 160px per 100% delta (was 40px — a single size step only moved
-            # this by ~2px, invisible after 30 diffusion steps smoothed it
-            # away). Capped at 90px so an extreme multi-step request dilates/
-            # erodes the repaint region without spilling into hair/background.
-            kernel_px = min(int(round(abs(fit_factor - 1.0) * 160)), 90)
+            # REVERTED (see FIT_STEP_DELTA comment above) — back to the
+            # known-good 40px/100% delta, no cap needed since FIT_FACTOR is
+            # bounded to 0.75-1.35 again (max kernel ~14px).
+            kernel_px = int(round(abs(fit_factor - 1.0) * 40))
             if kernel_px > 0:
                 kernel = np.ones((kernel_px, kernel_px), np.uint8)
                 mask_np = np.array(mask)
@@ -612,6 +615,18 @@ class GPUInferenceEngine:
         agnostic = person_pil.resize((SIZE_W, SIZE_H)).copy()
         agnostic.paste(mask_gray_img, None, Image.fromarray(np.uint8(mask)))
 
+        # TEMP DEBUG (regression investigation — safe to remove once sizing
+        # fix is confirmed on GPU): final repaint-mask coverage. A mask that
+        # has collapsed to a tiny fraction of the canvas is the direct
+        # symptom of over-aggressive erosion (see FIT_STEP_DELTA above).
+        final_mask_np = np.array(mask)
+        mask_on_px = int((final_mask_np > 127).sum())
+        mask_total_px = final_mask_np.size
+        logger.info(
+            "Final inpainting mask: %d / %d px (%.1f%%) marked for repaint, shape=%s",
+            mask_on_px, mask_total_px, 100.0 * mask_on_px / mask_total_px, final_mask_np.shape,
+        )
+
         if debug_dir is not None:
             _save_debug_image(mask, debug_dir / "04_agnostic_mask.png", "agnostic mask")
 
@@ -643,6 +658,9 @@ class GPUInferenceEngine:
         person_pil_raw = Image.open(person_path).convert("RGB")
         garment_orig = Image.open(garment_path).convert("RGB")
 
+        # TEMP DEBUG (regression investigation)
+        logger.info("Original garment size (source photo): %dx%d", *garment_orig.size)
+
         # Raw (un-letterboxed) copies of every submitted angle, for the
         # appearance/texture (IP-Adapter) conditioning below — CLIP's own
         # feature extractor handles resizing, so no letterbox needed here.
@@ -663,6 +681,8 @@ class GPUInferenceEngine:
         if debug_dir is not None:
             _save_debug_image(person_pil, debug_dir / "01b_person_letterboxed.jpg",
                                "letterboxed person image (pipeline input)")
+            _save_debug_image(garment_pil, debug_dir / "01c_garment_before_scaling.jpg",
+                               "letterboxed garment image, before Step 1b fit-scaling")
 
         # ── Step 1: Human parse + agnostic mask ──
         agnostic_pil, mask_pil, keypoints, parse_result = self._get_agnostic_mask(
@@ -687,10 +707,9 @@ class GPUInferenceEngine:
                 # an L garment on an M person should render bigger/looser than
                 # an M garment on the same person, and vice versa.
                 scale *= self._fit_scale_factor(person_size, garment_size)
-                # Clamp widened to match the stronger FIT_FACTOR range above —
-                # the previous 0.65-1.45 clamp was quietly capping the size
-                # signal at the extremes before it reached the diffusion model.
-                scale = max(0.55, min(scale, 1.65))
+                # REVERTED (see FIT_STEP_DELTA comment above) — paired with
+                # the FIT_FACTOR_MIN/MAX revert, back to the known-good clamp.
+                scale = max(0.65, min(scale, 1.45))
                 new_w = int(SIZE_W * scale)
                 new_h = int(SIZE_H * scale)
                 garment_scaled = garment_pil.resize((new_w, new_h), Image.LANCZOS)
@@ -700,13 +719,25 @@ class GPUInferenceEngine:
                 paste_y = (SIZE_H - new_h) // 2
                 canvas.paste(garment_scaled, (paste_x, paste_y))
                 garment_pil = canvas
-                logger.info("Garment scaled by %.2f (shoulder_w=%.0fpx, fit=%s->%s)",
-                            scale, person_shoulder_w, person_size, garment_size)
+                logger.info(
+                    "Garment scaled by %.2f (shoulder_w=%.0fpx, fit=%s->%s) — "
+                    "final garment conditioning size=%dx%d pasted on %dx%d canvas",
+                    scale, person_shoulder_w, person_size, garment_size,
+                    new_w, new_h, SIZE_W, SIZE_H,
+                )
 
         # ── Step 2: Prepare tensors ──
         pose_img       = self._render_pose_image(keypoints, SIZE_W, SIZE_H)
         pose_tensor    = tensor_tf(pose_img).unsqueeze(0).to(self.device, torch.float16)
         garment_tensor = tensor_tf(garment_pil).unsqueeze(0).to(self.device, torch.float16)
+
+        # TEMP DEBUG (regression investigation — safe to remove once sizing
+        # fix is confirmed on GPU): shapes actually handed to the pipeline.
+        logger.info(
+            "Final cloth tensor shape=%s dtype=%s | final mask array shape=%s | pose tensor shape=%s",
+            tuple(garment_tensor.shape), garment_tensor.dtype,
+            np.array(mask_pil).shape, tuple(pose_tensor.shape),
+        )
 
         # Appearance/texture conditioning — average CLIP embeddings across
         # every submitted garment angle so print/texture details visible only
