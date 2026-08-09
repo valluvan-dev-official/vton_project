@@ -443,7 +443,13 @@ class GPUInferenceEngine:
             embeds = [self._encode_clip_image_embeds(img) for img in garment_pils]
             avg_embed = torch.stack(embeds, dim=0).mean(dim=0)  # [1, embed_dim]
             negative_embed = torch.zeros_like(avg_embed)
-            cfg_embed = torch.cat([negative_embed, avg_embed], dim=0)  # [uncond, cond]
+            # SDXL IP-Adapter expects [2, num_images_per_prompt, embed_dim] —
+            # stack uncond/cond on a NEW leading dim rather than concatenating
+            # onto the existing batch dim, which previously produced a 2D
+            # [2, embed_dim] tensor missing the num_images_per_prompt axis and
+            # caused the UNet's encoder_hid_proj step to fail with
+            # "requires the keyword argument `image_embeds`".
+            cfg_embed = torch.stack([negative_embed, avg_embed], dim=0)  # [2, 1, embed_dim]
             return [cfg_embed.to(self.device, torch.float16)]
         except Exception:
             logger.exception(
