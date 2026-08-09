@@ -766,13 +766,16 @@ class GPUInferenceEngine:
             np.array(mask_pil).shape, tuple(pose_tensor.shape),
         )
 
-        # Appearance/texture conditioning — average CLIP embeddings across
-        # every submitted garment angle so print/texture details visible only
-        # in a close-up shot (say) still inform the result, not just whichever
-        # single image drives the spatial `cloth` channel above.
+        # NOTE: multi-image appearance averaging via ip_adapter_image_embeds
+        # is NOT usable here — this vendored/hacked tryon_pipeline.py only
+        # populates added_cond_kwargs["image_embeds"] when the singular
+        # `ip_adapter_image` (raw PIL) kwarg is passed; it has no code path
+        # for `ip_adapter_image_embeds` at all, so passing precomputed
+        # embeddings silently leaves added_cond_kwargs["image_embeds"] unset
+        # and crashes the UNet ("...requires the keyword argument
+        # `image_embeds`..."). Always drive appearance conditioning off the
+        # single best-selected garment image below instead.
         ip_adapter_embeds = None
-        if len(all_garment_pils_raw) > 1:
-            ip_adapter_embeds = self._build_ip_adapter_embeds(all_garment_pils_raw)
 
         if debug_dir is not None:
             _save_debug_image(garment_pil, debug_dir / "03_warped_garment.jpg",
