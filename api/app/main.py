@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from app.database import init_db
-from app.routes import tryon, status, fit
+from app.routes import tryon, status, fit, garment_catalog
 from app.config import get_settings
 
 settings = get_settings()
@@ -39,6 +39,7 @@ app.add_middleware(
 app.include_router(tryon.router, prefix="/api/v1", tags=["tryon"])
 app.include_router(status.router, prefix="/api/v1", tags=["status"])
 app.include_router(fit.router, prefix="/api/v1", tags=["fit"])
+app.include_router(garment_catalog.router, prefix="/api/v1", tags=["garment-catalog"])
 
 # Serve result images at /files/<relative-path>
 storage_path = Path(settings.LOCAL_STORAGE_PATH)

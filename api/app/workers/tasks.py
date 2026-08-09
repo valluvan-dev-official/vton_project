@@ -71,6 +71,34 @@ def _update_job(job_id: str, updates: dict):
     asyncio.run(_run())
 
 
+def _fetch_merchant_garment_measurements(merchant: str, sku: str, size_label: str):
+    """Synchronous DB lookup of one merchant SKU's size-chart entry, mapped
+    to fit_analysis's GarmentMeasurements — same sync-wrapped-async pattern
+    as _update_job above (fresh engine/session per call; Celery tasks are
+    sync, so each call gets its own short-lived asyncio loop rather than
+    sharing one across the worker process).
+
+    Returns None if no such (merchant, sku, size_label) row exists — the
+    caller (_compute_fit_analysis) treats that as insufficient_garment_data,
+    never as a reason to fail the job.
+    """
+    import asyncio
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from app.services.garment_catalog import get_size_chart_entry, to_garment_measurements
+
+    engine = create_async_engine(settings.DATABASE_URL)
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run():
+        async with Session() as session:
+            row = await get_size_chart_entry(session, merchant, sku, size_label)
+            result = to_garment_measurements(row) if row is not None else None
+        await engine.dispose()
+        return result
+
+    return asyncio.run(_run())
+
+
 # ── Quality scoring ───────────────────────────────────────────────────────────
 
 def _compute_ssim(path_a: str, path_b: str) -> float:
@@ -92,6 +120,7 @@ def _compute_ssim(path_a: str, path_b: str) -> float:
 
 def _compute_fit_analysis(
     local_person: str, garment_size: str, height_cm, person_size_estimate: str,
+    merchant=None, garment_sku=None,
 ) -> "str | None":
     """Returns a JSON string (FitAnalysisOut shape) or None if analysis
     could not be computed at all (an unexpected error). Missing/insufficient
@@ -100,6 +129,15 @@ def _compute_fit_analysis(
     (see FitEngine.insufficient_garment_data()) rather than silently
     presenting the illustrative DEFAULT_TSHIRT_SIZE_CHART as authoritative
     merchant sizing.
+
+    Garment measurement resolution priority (Phase 2):
+      1. Real merchant catalog row for (merchant, garment_sku, garment_size)
+         — see app/services/garment_catalog.py. Authoritative; used
+         whenever both merchant and garment_sku are supplied, regardless
+         of FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG.
+      2. The illustrative DEFAULT_TSHIRT_SIZE_CHART — dev/test only, and
+         only when FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG is explicitly True.
+      3. Neither available -> insufficient_garment_data.
 
     Timed and logged on every path (success, insufficient data, or
     failure) so completion-time impact on the try-on job is always visible.
@@ -123,26 +161,41 @@ def _compute_fit_analysis(
 
         engine_instance = FitEngine()
 
+        garment = None
+        garment_source_note = "none"
+
+        if merchant and garment_sku:
+            garment = _fetch_merchant_garment_measurements(merchant, garment_sku, garment_size)
+            garment_source_note = "merchant_catalog" if garment is not None else "merchant_catalog_miss"
+
         # DEFAULT_TSHIRT_SIZE_CHART is a dev/test fallback ONLY (see
         # garment_measurements.py) — never used as if it were real merchant
-        # data unless explicitly opted into via settings. No real catalog
-        # integration exists yet, so this is False (and thus
-        # insufficient_garment_data) in production by default.
-        garment = None
-        if settings.FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG:
+        # data unless explicitly opted into via settings, and never used at
+        # all once a real (merchant, garment_sku) lookup has already run
+        # (whether it hit or missed) — falling back to illustrative data
+        # after an explicit real-catalog lookup failed would silently
+        # mislabel a specific product's sizing as generic.
+        if garment is None and garment_source_note == "none" and settings.FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG:
             garment = get_default_garment_measurements(garment_size)
+            garment_source_note = "default_chart" if garment is not None else "none"
 
         if garment is None:
             logger.info(
                 "fit_analysis: no authoritative garment measurements for size "
-                "%r (FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG=%s) — reporting "
-                "insufficient_garment_data rather than an apparent fit.",
-                garment_size, settings.FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG,
+                "%r (merchant=%r sku=%r resolution=%s FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG=%s) "
+                "— reporting insufficient_garment_data rather than an apparent fit.",
+                garment_size, merchant, garment_sku, garment_source_note,
+                settings.FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG,
             )
             fit_result = engine_instance.insufficient_garment_data(garment_size)
             payload = fit_result.as_dict()
             payload["estimated_person_size"] = person_size_estimate
+            # "measurement_source" here is the BODY estimate's source (see
+            # below on the success path) — kept None on this path since no
+            # body analysis was attempted either. "garment_measurement_source"
+            # is the garment side specifically — see its comment below.
             payload["measurement_source"] = None
+            payload["garment_measurement_source"] = None
             return _json.dumps(payload)
 
         # Read-only reuse of the already-loaded GPU pose engine (see
@@ -160,7 +213,15 @@ def _compute_fit_analysis(
 
         payload = fit_result.as_dict()
         payload["estimated_person_size"] = person_size_estimate
+        # "measurement_source" = how the BODY measurements were obtained
+        # (always "estimated" today — image-derived). "garment_measurement_
+        # source" = how the GARMENT measurements were obtained: this is the
+        # field that must read "merchant_provided" when a real catalog SKU
+        # was matched, vs. "illustrative_default" for the dev/test chart —
+        # never conflate the two (Phase 2 review fix: previously only the
+        # body's source was surfaced at all).
         payload["measurement_source"] = body.measurement_source
+        payload["garment_measurement_source"] = garment.measurement_source
         return _json.dumps(payload)
 
     except Exception:
@@ -281,7 +342,7 @@ def _resolve_local_path(s3_key_or_path: str, job_id: str, role: str) -> str:
 @celery_app.task(bind=True, name="tasks.process_tryon_job", max_retries=2)
 def process_tryon_job(self, job_id: str, person_image_path: str,
                        garment_image_paths, garment_size: str = "M",
-                       height_cm=None):
+                       height_cm=None, merchant=None, garment_sku=None):
     """
     Main try-on pipeline:
       1. Resolve input images (download from S3 if needed)
@@ -289,14 +350,14 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
       3. Upload result to S3
       4. SSIM quality score
       5. Auto-save training pair when score >= MIN_QUALITY_SCORE
-      5b. (Phase 1, shadow mode) Compute fit_analysis metadata — best-effort,
-          never affects render output or job success/failure. See
-          _compute_fit_analysis() above.
+      5b. (Phase 1/2, shadow mode) Compute fit_analysis metadata —
+          best-effort, never affects render output or job success/failure.
+          See _compute_fit_analysis() above.
       6. Update DB — completed / failed
 
-    height_cm is optional and defaults to None so existing callers that
-    invoke this task with the pre-Phase-1 4-argument signature keep working
-    unchanged.
+    height_cm, merchant, garment_sku are optional and default to None so
+    existing callers that invoke this task with an older, shorter
+    positional signature keep working unchanged.
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -362,11 +423,12 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
             _save_training_pair(job_id, local_person, local_garments[0], output_path, score)
             saved = True
 
-        # ── 5b. Fit analysis (Phase 1, shadow mode) ───────────────────────
+        # ── 5b. Fit analysis (Phase 1/2, shadow mode) ─────────────────────
         # Never allowed to affect the result above — computed and stored
         # only. See _compute_fit_analysis().
         fit_analysis_json = _compute_fit_analysis(
             local_person, garment_size, height_cm, person_size_estimate,
+            merchant, garment_sku,
         )
 
         # ── 6. Mark completed ─────────────────────────────────────────────

@@ -7,6 +7,7 @@ import pytest
 
 from api.app.services.fit_analysis.models import (
     MEASUREMENT_SOURCE_ESTIMATED,
+    MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT,
     MEASUREMENT_SOURCE_MERCHANT_PROVIDED,
     MEASUREMENT_SOURCE_USER_PROVIDED,
     BodyMeasurementEstimate,
@@ -16,14 +17,18 @@ from api.app.services.fit_analysis.models import (
 
 
 class TestMeasurementSource:
-    def test_all_three_sources_are_valid(self):
+    def test_all_four_sources_are_valid(self):
         for source in (
             MEASUREMENT_SOURCE_ESTIMATED,
             MEASUREMENT_SOURCE_USER_PROVIDED,
             MEASUREMENT_SOURCE_MERCHANT_PROVIDED,
+            MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT,
         ):
             body = BodyMeasurementEstimate(measurement_source=source, confidence=0.5)
             assert body.measurement_source == source
+
+    def test_illustrative_default_is_distinct_from_merchant_provided(self):
+        assert MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT != MEASUREMENT_SOURCE_MERCHANT_PROVIDED
 
     def test_invalid_source_rejected(self):
         with pytest.raises(ValueError):

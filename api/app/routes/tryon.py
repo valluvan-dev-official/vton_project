@@ -82,6 +82,22 @@ def _validate_height_cm(height_cm: Optional[float]) -> Optional[float]:
     return height_cm
 
 
+# Optional — identifies which merchant catalog entry (see
+# app/services/garment_catalog.py) fit_analysis should look up for this
+# job's garment_size. Used only for the Phase-1 shadow-mode fit_analysis
+# metadata; never affects try-on rendering. Both must be provided together
+# (a SKU with no merchant, or vice versa, can't resolve to a catalog row).
+def _validate_merchant_sku(merchant: Optional[str], garment_sku: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    merchant = (merchant or "").strip() or None
+    garment_sku = (garment_sku or "").strip() or None
+    if (merchant is None) != (garment_sku is None):
+        raise HTTPException(
+            status_code=422,
+            detail="merchant and garment_sku must be provided together, or not at all.",
+        )
+    return merchant, garment_sku
+
+
 async def _ingest_job_inputs(
     job_id: str,
     person_image: UploadFile,
@@ -184,10 +200,19 @@ async def submit_tryon(
                            "Phase-1 shadow-mode fit_analysis metadata; never "
                            "affects try-on rendering."
     ),
+    merchant: Optional[str] = Form(
+        None, description="Optional, with garment_sku — identifies the merchant "
+                           "catalog entry fit_analysis should use for this "
+                           "garment_size. Never affects try-on rendering."
+    ),
+    garment_sku: Optional[str] = Form(
+        None, description="Optional, with merchant — see merchant."
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     garment_size = _validate_garment_size(garment_size)
     height_cm = _validate_height_cm(height_cm)
+    merchant, garment_sku = _validate_merchant_sku(merchant, garment_sku)
     job_id = str(uuid.uuid4())
 
     person_ref, garment_refs = await _ingest_job_inputs(job_id, person_image, garment_images)
@@ -202,7 +227,7 @@ async def submit_tryon(
     db.add(job)
     await db.commit()
 
-    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm)
+    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku)
 
     return {
         "job_id": job_id,
@@ -229,6 +254,14 @@ async def submit_tryon_sync(
                            "Phase-1 shadow-mode fit_analysis metadata; never "
                            "affects try-on rendering."
     ),
+    merchant: Optional[str] = Form(
+        None, description="Optional, with garment_sku — identifies the merchant "
+                           "catalog entry fit_analysis should use for this "
+                           "garment_size. Never affects try-on rendering."
+    ),
+    garment_sku: Optional[str] = Form(
+        None, description="Optional, with merchant — see merchant."
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """For programmatic integrations that want a single request/response
@@ -241,6 +274,7 @@ async def submit_tryon_sync(
     """
     garment_size = _validate_garment_size(garment_size)
     height_cm = _validate_height_cm(height_cm)
+    merchant, garment_sku = _validate_merchant_sku(merchant, garment_sku)
     job_id = str(uuid.uuid4())
 
     person_ref, garment_refs = await _ingest_job_inputs(job_id, person_image, garment_images)
@@ -255,7 +289,7 @@ async def submit_tryon_sync(
     db.add(job)
     await db.commit()
 
-    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm)
+    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku)
 
     # Poll a fresh session each time so we see committed updates from the worker.
     elapsed = 0

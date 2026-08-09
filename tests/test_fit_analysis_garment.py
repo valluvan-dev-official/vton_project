@@ -39,9 +39,14 @@ class TestDefaultSizeChart:
         assert chests == sorted(chests)
         assert shoulders == sorted(shoulders)
 
-    def test_default_chart_is_merchant_provided_source(self):
+    def test_default_chart_is_illustrative_not_merchant_provided_source(self):
+        """Phase 2 review fix: this chart is made-up dev/test data, not a
+        real merchant's catalog — it must never claim measurement_source
+        "merchant_provided" (that would be indistinguishable from a real
+        catalog hit in fit_analysis output)."""
         for g in DEFAULT_TSHIRT_SIZE_CHART.values():
-            assert g.measurement_source == "merchant_provided"
+            assert g.measurement_source == "illustrative_default"
+            assert g.measurement_source != "merchant_provided"
 
 
 class TestValidateGarmentMeasurements:

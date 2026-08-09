@@ -22,11 +22,17 @@ from typing import Optional
 MEASUREMENT_SOURCE_ESTIMATED = "estimated"
 MEASUREMENT_SOURCE_USER_PROVIDED = "user_provided"
 MEASUREMENT_SOURCE_MERCHANT_PROVIDED = "merchant_provided"
+# Made-up, illustrative numbers (see fit_analysis/garment_measurements.py's
+# DEFAULT_TSHIRT_SIZE_CHART) — distinct from MEASUREMENT_SOURCE_MERCHANT_PROVIDED
+# on purpose, so a consumer of fit_analysis output can never mistake
+# dev/test placeholder data for a real merchant's authoritative sizing.
+MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT = "illustrative_default"
 
 VALID_MEASUREMENT_SOURCES = frozenset({
     MEASUREMENT_SOURCE_ESTIMATED,
     MEASUREMENT_SOURCE_USER_PROVIDED,
     MEASUREMENT_SOURCE_MERCHANT_PROVIDED,
+    MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT,
 })
 
 
@@ -36,6 +42,14 @@ def _validate_source(value: str, field_name: str = "measurement_source") -> str:
             f"{field_name}={value!r} is not one of {sorted(VALID_MEASUREMENT_SOURCES)}."
         )
     return value
+
+
+# Same vocabulary as app/models/fit.py's STRETCH_CATEGORIES/FIT_STYLES,
+# duplicated as plain constants rather than imported — keeps this package
+# free of any SQLAlchemy/app.models import, consistent with the
+# no-framework-imports rule at the top of this file.
+VALID_STRETCH_CATEGORIES = frozenset({"none", "low", "medium", "high"})
+VALID_FIT_STYLES = frozenset({"slim", "regular", "relaxed", "oversized"})
 
 
 @dataclass
@@ -155,6 +169,15 @@ class GarmentMeasurements:
     hip_cm: Optional[float] = None
     measurement_source: str = MEASUREMENT_SOURCE_MERCHANT_PROVIDED
 
+    # Stored/passed through for data fidelity (Phase 2 merchant catalog
+    # schema requires them) but NOT yet consumed by fit_engine.py's ease
+    # bands — FitEngine.evaluate()'s math is deliberately left unchanged so
+    # existing, already-tested fit classification behavior doesn't shift as
+    # a side effect of catalog integration. A future phase can fold these
+    # into the ease calculation explicitly.
+    stretch_category: str = "none"
+    fit_style: str = "regular"
+
     def __post_init__(self):
         _validate_source(self.measurement_source)
         if not (self.size_label or "").strip():
@@ -163,6 +186,13 @@ class GarmentMeasurements:
             v = getattr(self, name)
             if v is not None and v <= 0:
                 raise ValueError(f"{name}={v!r} must be positive when provided.")
+        if self.stretch_category not in VALID_STRETCH_CATEGORIES:
+            raise ValueError(
+                f"stretch_category={self.stretch_category!r} is not one of "
+                f"{sorted(VALID_STRETCH_CATEGORIES)}."
+            )
+        if self.fit_style not in VALID_FIT_STYLES:
+            raise ValueError(f"fit_style={self.fit_style!r} is not one of {sorted(VALID_FIT_STYLES)}.")
 
     def completeness_ratio(self) -> float:
         """Fraction of the 3 fit-critical dimensions (chest/shoulder/length)

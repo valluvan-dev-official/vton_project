@@ -16,7 +16,7 @@ from app.config import get_settings  # noqa: E402
 # Import every model module so its tables register on Base.metadata —
 # required for autogenerate and for this env.py to be a complete picture
 # of the schema, even though the versions/ migrations below are hand-written.
-from app.models import job, fit  # noqa: E402,F401
+from app.models import job, fit, garment_catalog  # noqa: E402,F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", get_settings().DATABASE_URL)

@@ -20,19 +20,24 @@ this chart as if it were authoritative.
 """
 from typing import Optional
 
-from .models import MEASUREMENT_SOURCE_MERCHANT_PROVIDED, GarmentMeasurements
+from .models import MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT, MEASUREMENT_SOURCE_MERCHANT_PROVIDED, GarmentMeasurements
 
 # Illustrative generic T-shirt chart (cm), broadly in line with common
 # unisex retail size charts. Not tied to any specific merchant/product —
 # do not treat as authoritative for a real garment. See module docstring:
 # gated behind settings.FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG by the caller.
+#
+# measurement_source is explicitly ILLUSTRATIVE_DEFAULT (not the dataclass's
+# own MERCHANT_PROVIDED default) — leaving it at the dataclass default here
+# would mislabel this made-up chart as authoritative merchant data in any
+# fit_analysis output that surfaces it (Phase 2 review fix).
 DEFAULT_TSHIRT_SIZE_CHART: dict[str, GarmentMeasurements] = {
-    "XS": GarmentMeasurements(size_label="XS", garment_type="t-shirt", chest_cm=86.0, shoulder_cm=40.0, length_cm=64.0, sleeve_length_cm=18.0),
-    "S":  GarmentMeasurements(size_label="S",  garment_type="t-shirt", chest_cm=92.0, shoulder_cm=42.0, length_cm=66.0, sleeve_length_cm=19.0),
-    "M":  GarmentMeasurements(size_label="M",  garment_type="t-shirt", chest_cm=100.0, shoulder_cm=44.0, length_cm=69.0, sleeve_length_cm=21.0),
-    "L":  GarmentMeasurements(size_label="L",  garment_type="t-shirt", chest_cm=108.0, shoulder_cm=46.5, length_cm=71.0, sleeve_length_cm=22.0),
-    "XL": GarmentMeasurements(size_label="XL", garment_type="t-shirt", chest_cm=116.0, shoulder_cm=49.0, length_cm=73.0, sleeve_length_cm=23.0),
-    "XXL": GarmentMeasurements(size_label="XXL", garment_type="t-shirt", chest_cm=124.0, shoulder_cm=51.5, length_cm=75.0, sleeve_length_cm=24.0),
+    "XS": GarmentMeasurements(size_label="XS", garment_type="t-shirt", chest_cm=86.0, shoulder_cm=40.0, length_cm=64.0, sleeve_length_cm=18.0, measurement_source=MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT),
+    "S":  GarmentMeasurements(size_label="S",  garment_type="t-shirt", chest_cm=92.0, shoulder_cm=42.0, length_cm=66.0, sleeve_length_cm=19.0, measurement_source=MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT),
+    "M":  GarmentMeasurements(size_label="M",  garment_type="t-shirt", chest_cm=100.0, shoulder_cm=44.0, length_cm=69.0, sleeve_length_cm=21.0, measurement_source=MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT),
+    "L":  GarmentMeasurements(size_label="L",  garment_type="t-shirt", chest_cm=108.0, shoulder_cm=46.5, length_cm=71.0, sleeve_length_cm=22.0, measurement_source=MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT),
+    "XL": GarmentMeasurements(size_label="XL", garment_type="t-shirt", chest_cm=116.0, shoulder_cm=49.0, length_cm=73.0, sleeve_length_cm=23.0, measurement_source=MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT),
+    "XXL": GarmentMeasurements(size_label="XXL", garment_type="t-shirt", chest_cm=124.0, shoulder_cm=51.5, length_cm=75.0, sleeve_length_cm=24.0, measurement_source=MEASUREMENT_SOURCE_ILLUSTRATIVE_DEFAULT),
 }
 
 
