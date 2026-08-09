@@ -97,6 +97,84 @@ def _save_debug_image(img, path: Path, description: str = "") -> None:
         logger.exception("Failed to save debug artifact %s (%s)", path, description)
 
 
+def _wrap_vae_dtype_safe(vae) -> None:
+    """Make vae.encode()/vae.decode() dtype-transparent at the call boundary.
+
+    Root cause this works around: IDM-VTON's vendored tryon_pipeline.py
+    assumes the VAE is either always fp16, or briefly upcast-then-restored
+    via its own internal `force_upcast`/`needs_upcasting` logic. We load
+    the VAE in fp32 permanently (see _load_idm_pipeline) to stop garment
+    color/hue shift, which that assumption doesn't cover:
+      - the pose-conditioning line `self.vae.encode(pose_img)` casts its
+        input to `prompt_embeds.dtype` (fp16) with NO upcast guard at all,
+      - the final-decode upcast guard only fires when `self.vae.dtype ==
+        torch.float16`, which is never true once the VAE is loaded fp32.
+    Both feed a Half tensor into fp32 VAE weights — exactly "Input type
+    (c10::Half) and bias type (float) should be the same."
+
+    Fix: intercept at the VAE module boundary instead of changing dtypes
+    anywhere else in the pipeline (UNet/text encoders stay fp16). Any
+    tensor handed to encode/decode is cast to the VAE's *current* actual
+    parameter dtype right before the real call (so the conv/groupnorm math
+    always runs in matching dtypes), and the result is cast back to
+    whatever dtype the caller originally passed in (so downstream fp16
+    UNet code keeps working unmodified). Parameter dtype is re-read on
+    every call rather than cached once, since the pipeline's own upcast
+    dance can flip vae.dtype between calls.
+    """
+    orig_encode = vae.encode
+    orig_decode = vae.decode
+
+    def _cast_output_like(out, dtype):
+        if torch.is_tensor(out):
+            return out.to(dtype)
+        if hasattr(out, "latent_dist"):
+            dist = out.latent_dist
+            orig_sample, orig_mode = dist.sample, dist.mode
+            dist.sample = lambda *a, **kw: orig_sample(*a, **kw).to(dtype)
+            dist.mode = lambda *a, **kw: orig_mode(*a, **kw).to(dtype)
+            return out
+        if hasattr(out, "sample") and torch.is_tensor(out.sample):
+            out.sample = out.sample.to(dtype)
+            return out
+        if isinstance(out, tuple):
+            return tuple(o.to(dtype) if torch.is_tensor(o) else o for o in out)
+        return out
+
+    def encode(x, *args, **kwargs):
+        caller_dtype = x.dtype
+        param_dtype = next(vae.parameters()).dtype
+        if caller_dtype != param_dtype:
+            logger.debug(
+                "VAE boundary: encode() input dtype=%s != vae param dtype=%s — "
+                "casting input to %s for the forward pass, will cast result back to %s.",
+                caller_dtype, param_dtype, param_dtype, caller_dtype,
+            )
+            x = x.to(param_dtype)
+        out = orig_encode(x, *args, **kwargs)
+        if caller_dtype != param_dtype:
+            out = _cast_output_like(out, caller_dtype)
+        return out
+
+    def decode(z, *args, **kwargs):
+        caller_dtype = z.dtype
+        param_dtype = next(vae.parameters()).dtype
+        if caller_dtype != param_dtype:
+            logger.debug(
+                "VAE boundary: decode() input dtype=%s != vae param dtype=%s — "
+                "casting input to %s for the forward pass, will cast result back to %s.",
+                caller_dtype, param_dtype, param_dtype, caller_dtype,
+            )
+            z = z.to(param_dtype)
+        out = orig_decode(z, *args, **kwargs)
+        if caller_dtype != param_dtype:
+            out = _cast_output_like(out, caller_dtype)
+        return out
+
+    vae.encode = encode
+    vae.decode = decode
+
+
 class GPUInferenceEngine:
     """Preloads all IDM-VTON models once, then runs inference per-job."""
 
@@ -218,7 +296,14 @@ class GPUInferenceEngine:
         )
         self._pipe.unet_encoder = unet_encoder
         self._pipe.to(self.device)
-        logger.info("IDM-VTON pipeline loaded.")
+
+        # See _wrap_vae_dtype_safe docstring: the fp32 VAE above needs a
+        # dtype-transparent encode()/decode() boundary because the vendored
+        # pipeline internally casts pose/latent tensors to the (fp16)
+        # UNet/text-encoder dtype before handing them to the VAE.
+        _wrap_vae_dtype_safe(self._pipe.vae)
+
+        logger.info("IDM-VTON pipeline loaded (unet=fp16, vae=fp32, dtype-safe VAE boundary active).")
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
 

@@ -156,7 +156,9 @@ class InferenceRouter:
                 )
                 return output_path
             except Exception as exc:
-                logger.warning(f"Local GPU inference failed: {exc}. Falling back to placeholder.")
+                logger.exception(
+                    f"Local GPU inference failed: {exc}. Falling back to placeholder."
+                )
 
         return self._run_placeholder(person_image_path, clean_garment_paths[0], output_path)
 
