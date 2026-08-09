@@ -4,6 +4,8 @@ import logging
 import uuid
 from pathlib import Path
 
+from typing import Optional
+
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.responses import Response, RedirectResponse
 from sqlalchemy import select
@@ -61,6 +63,23 @@ def _validate_garment_size(garment_size: str) -> str:
             detail=f"garment_size: must be one of {sorted(ALLOWED_GARMENT_SIZES)}."
         )
     return garment_size
+
+
+# Sanity bounds only — not a measurement-accuracy claim. Used solely as an
+# optional scale reference for Phase-1 shadow-mode fit analysis (see
+# app/services/fit_analysis); never affects try-on rendering.
+MIN_HEIGHT_CM, MAX_HEIGHT_CM = 100.0, 250.0
+
+
+def _validate_height_cm(height_cm: Optional[float]) -> Optional[float]:
+    if height_cm is None:
+        return None
+    if not (MIN_HEIGHT_CM <= height_cm <= MAX_HEIGHT_CM):
+        raise HTTPException(
+            status_code=422,
+            detail=f"height_cm: must be between {MIN_HEIGHT_CM:.0f} and {MAX_HEIGHT_CM:.0f} if provided."
+        )
+    return height_cm
 
 
 async def _ingest_job_inputs(
@@ -160,9 +179,15 @@ async def submit_tryon(
                           "The clearest one is auto-selected for inference."
     ),
     garment_size: str = Form("M", description="Garment size label: XS/S/M/L/XL/XXL"),
+    height_cm: Optional[float] = Form(
+        None, description="Optional — used only as a scale reference for the "
+                           "Phase-1 shadow-mode fit_analysis metadata; never "
+                           "affects try-on rendering."
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     garment_size = _validate_garment_size(garment_size)
+    height_cm = _validate_height_cm(height_cm)
     job_id = str(uuid.uuid4())
 
     person_ref, garment_refs = await _ingest_job_inputs(job_id, person_image, garment_images)
@@ -177,7 +202,7 @@ async def submit_tryon(
     db.add(job)
     await db.commit()
 
-    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size)
+    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm)
 
     return {
         "job_id": job_id,
@@ -199,6 +224,11 @@ async def submit_tryon_sync(
         ..., description=f"1-{MAX_GARMENT_IMAGES} photos of the SAME garment from different angles."
     ),
     garment_size: str = Form("M", description="Garment size label: XS/S/M/L/XL/XXL"),
+    height_cm: Optional[float] = Form(
+        None, description="Optional — used only as a scale reference for the "
+                           "Phase-1 shadow-mode fit_analysis metadata; never "
+                           "affects try-on rendering."
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """For programmatic integrations that want a single request/response
@@ -210,6 +240,7 @@ async def submit_tryon_sync(
     long-lived connection, or if you're firing many jobs concurrently.
     """
     garment_size = _validate_garment_size(garment_size)
+    height_cm = _validate_height_cm(height_cm)
     job_id = str(uuid.uuid4())
 
     person_ref, garment_refs = await _ingest_job_inputs(job_id, person_image, garment_images)
@@ -224,7 +255,7 @@ async def submit_tryon_sync(
     db.add(job)
     await db.commit()
 
-    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size)
+    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm)
 
     # Poll a fresh session each time so we see committed updates from the worker.
     elapsed = 0

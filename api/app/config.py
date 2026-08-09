@@ -61,6 +61,16 @@ class Settings(BaseSettings):
     # API limits
     MAX_UPLOAD_SIZE_MB: int = 10
 
+    # ── Fit analysis (Phase 1, shadow mode) ──────────────────────────────────
+    # Gates api/app/services/fit_analysis/garment_measurements.py's
+    # illustrative DEFAULT_TSHIRT_SIZE_CHART. Defaults to False (safe) so a
+    # production deployment never silently presents made-up garment
+    # measurements as if they were real merchant/catalog sizing — with this
+    # off (or no real catalog data available for a given size), fit_analysis
+    # reports "insufficient_garment_data" instead of an apparent fit.
+    # Set True only for local dev/test where no real catalog is wired up.
+    FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG: bool = False
+
     # ── SageMaker Async Inference (disabled for GPU-EC2 deployment) ──────────
     # To switch back to SageMaker, uncomment the fields below, populate .env,
     # and restore the [SAGEMAKER] lines in tasks.py and inference.py.

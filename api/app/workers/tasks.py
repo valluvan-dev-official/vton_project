@@ -83,6 +83,101 @@ def _compute_ssim(path_a: str, path_b: str) -> float:
     return float(score)
 
 
+# ── Fit analysis (Phase 1, shadow mode) ─────────────────────────────────────
+#
+# Computed AFTER inference has already produced a result, purely as
+# additional metadata. Never influences the try-on render — see
+# app/services/fit_analysis/__init__.py. Any failure here is caught and
+# logged; it must never fail the try-on job itself.
+
+def _compute_fit_analysis(
+    local_person: str, garment_size: str, height_cm, person_size_estimate: str,
+) -> "str | None":
+    """Returns a JSON string (FitAnalysisOut shape) or None if analysis
+    could not be computed at all (an unexpected error). Missing/insufficient
+    garment catalog data is NOT treated as an error — it still returns a
+    JSON payload, with every fit field reporting "insufficient_garment_data"
+    (see FitEngine.insufficient_garment_data()) rather than silently
+    presenting the illustrative DEFAULT_TSHIRT_SIZE_CHART as authoritative
+    merchant sizing.
+
+    Timed and logged on every path (success, insufficient data, or
+    failure) so completion-time impact on the try-on job is always visible.
+    """
+    import logging
+    import time
+    logger = logging.getLogger(__name__)
+    start = time.perf_counter()
+
+    try:
+        import json as _json
+        from PIL import Image
+
+        from app.services.fit_analysis import (
+            BodyAnalyzer,
+            EngineReadOnlyPoseAdapter,
+            FitEngine,
+            get_default_garment_measurements,
+            try_get_pose_engine,
+        )
+
+        engine_instance = FitEngine()
+
+        # DEFAULT_TSHIRT_SIZE_CHART is a dev/test fallback ONLY (see
+        # garment_measurements.py) — never used as if it were real merchant
+        # data unless explicitly opted into via settings. No real catalog
+        # integration exists yet, so this is False (and thus
+        # insufficient_garment_data) in production by default.
+        garment = None
+        if settings.FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG:
+            garment = get_default_garment_measurements(garment_size)
+
+        if garment is None:
+            logger.info(
+                "fit_analysis: no authoritative garment measurements for size "
+                "%r (FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG=%s) — reporting "
+                "insufficient_garment_data rather than an apparent fit.",
+                garment_size, settings.FIT_ANALYSIS_ALLOW_DEFAULT_CATALOG,
+            )
+            fit_result = engine_instance.insufficient_garment_data(garment_size)
+            payload = fit_result.as_dict()
+            payload["estimated_person_size"] = person_size_estimate
+            payload["measurement_source"] = None
+            return _json.dumps(payload)
+
+        # Read-only reuse of the already-loaded GPU pose engine (see
+        # pose_adapter.py) — never constructs/loads a fresh model; returns
+        # None immediately for non-GPU deployments (try_get_pose_engine's
+        # own device/weights_dir short-circuit).
+        landmarks = None
+        engine = try_get_pose_engine(settings.DEVICE, settings.WEIGHTS_DIR)
+        if engine is not None:
+            person_img = Image.open(local_person).convert("RGB")
+            landmarks = EngineReadOnlyPoseAdapter(engine).get_landmarks(person_img)
+
+        body = BodyAnalyzer().analyze(height_cm=height_cm, landmarks=landmarks)
+        fit_result = engine_instance.evaluate(body, garment)
+
+        payload = fit_result.as_dict()
+        payload["estimated_person_size"] = person_size_estimate
+        payload["measurement_source"] = body.measurement_source
+        return _json.dumps(payload)
+
+    except Exception:
+        logger.warning(
+            "fit_analysis: shadow-mode computation failed; job result is "
+            "unaffected, fit_analysis will be omitted.", exc_info=True,
+        )
+        return None
+
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "fit_analysis: _compute_fit_analysis completed in %.1fms "
+            "(shadow mode — no effect on try-on job outcome).", elapsed_ms,
+        )
+
+
 # ── Training pair persistence ─────────────────────────────────────────────────
 
 def _save_training_pair(job_id: str, person_path: str, garment_path: str,
@@ -185,7 +280,8 @@ def _resolve_local_path(s3_key_or_path: str, job_id: str, role: str) -> str:
 
 @celery_app.task(bind=True, name="tasks.process_tryon_job", max_retries=2)
 def process_tryon_job(self, job_id: str, person_image_path: str,
-                       garment_image_paths, garment_size: str = "M"):
+                       garment_image_paths, garment_size: str = "M",
+                       height_cm=None):
     """
     Main try-on pipeline:
       1. Resolve input images (download from S3 if needed)
@@ -193,7 +289,14 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
       3. Upload result to S3
       4. SSIM quality score
       5. Auto-save training pair when score >= MIN_QUALITY_SCORE
+      5b. (Phase 1, shadow mode) Compute fit_analysis metadata — best-effort,
+          never affects render output or job success/failure. See
+          _compute_fit_analysis() above.
       6. Update DB — completed / failed
+
+    height_cm is optional and defaults to None so existing callers that
+    invoke this task with the pre-Phase-1 4-argument signature keep working
+    unchanged.
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -259,6 +362,13 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
             _save_training_pair(job_id, local_person, local_garments[0], output_path, score)
             saved = True
 
+        # ── 5b. Fit analysis (Phase 1, shadow mode) ───────────────────────
+        # Never allowed to affect the result above — computed and stored
+        # only. See _compute_fit_analysis().
+        fit_analysis_json = _compute_fit_analysis(
+            local_person, garment_size, height_cm, person_size_estimate,
+        )
+
         # ── 6. Mark completed ─────────────────────────────────────────────
         _update_job(job_id, {
             "status":               "completed",
@@ -266,6 +376,7 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
             "quality_score":        score,
             "saved_as_training":    saved,
             "person_size_estimate": person_size_estimate,
+            "fit_analysis_json":    fit_analysis_json,
         })
 
     except Exception as exc:

@@ -1,3 +1,4 @@
+import json
 import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
@@ -30,10 +31,23 @@ class Job(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     saved_as_training: Mapped[bool] = mapped_column(Boolean, default=False)
     user_consent: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Phase 1 shadow-mode fit analysis (api/app/services/fit_analysis) —
+    # JSON-serialized FitAnalysisOut, or NULL if analysis wasn't computed /
+    # failed / this row predates the feature. Never read by inference; see
+    # fit_analysis/__init__.py docstring. Nullable and additive so existing
+    # rows and clients that don't know about it are unaffected.
+    fit_analysis_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     def to_dict(self, result_url: str | None = None) -> dict:
+        fit_analysis = None
+        if self.fit_analysis_json:
+            try:
+                fit_analysis = json.loads(self.fit_analysis_json)
+            except (TypeError, ValueError):
+                fit_analysis = None
+
         return {
             "id": self.id,
             "status": self.status.value,
@@ -44,6 +58,7 @@ class Job(Base):
             "saved_as_training": self.saved_as_training,
             "user_consent": self.user_consent,
             "error_message": self.error_message,
+            "fit_analysis": fit_analysis,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
