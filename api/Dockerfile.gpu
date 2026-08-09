@@ -1,7 +1,12 @@
-# ── DCI-VTON GPU Worker / API image ──────────────────────────────────────────
+# ── DCI-VTON GPU Worker image ─────────────────────────────────────────────────
+#
+# Used ONLY by the `worker` service in docker-compose.gpu.yml — api/flower
+# build from the lightweight api/Dockerfile instead (they never run GPU
+# inference, just enqueue/monitor Celery jobs), so they don't need this
+# CUDA base image or the requirements-gpu.txt stack at all.
 #
 # Build context: project root (one level above api/)
-#   docker compose -f api/docker-compose.gpu.yml build
+#   docker compose -f api/docker-compose.gpu.yml build worker
 #
 # The ml/ directory is NOT copied into the image at build time — it is
 # volume-mounted at runtime (../ml:/app/ml in docker-compose.gpu.yml) so
@@ -47,11 +52,37 @@ COPY api/requirements-gpu.txt ./requirements-gpu.txt
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir -r requirements-gpu.txt
 
-# Copy FastAPI application code
-COPY api/ .
+# Copy ONLY what the Celery GPU worker actually imports at runtime
+# (entrypoint: `celery -A app.workers.tasks.celery_app worker -I
+# app.workers.worker_startup`). Verified by tracing the full import graph
+# from tasks.py/worker_startup.py through every service/model module,
+# including deferred/lazy imports inside function bodies.
+#
+# Deliberately EXCLUDED — never imported by the worker, only by the FastAPI
+# app (api/flower, built from the lightweight api/Dockerfile instead):
+#   app/routes/, app/schemas/, app/static/, app/main.py, alembic/, alembic.ini
+#
+# This means a change to an API route, a pydantic schema, or a frontend
+# static asset no longer invalidates this image's build cache at all, so it
+# can no longer force a worker rebuild+recreate on deploy (see
+# scripts/deploy.sh's git-diff-based recreate gate for the other half of
+# this: even a genuine image change here only recreates the worker
+# container, never api/flower, and vice versa).
+#
+# If a new worker dependency is ever added OUTSIDE
+# app/{__init__.py,config.py,database.py,workers/,models/,services/}, it
+# must be added below too, or the worker image will silently miss it.
+COPY api/app/__init__.py  ./app/__init__.py
+COPY api/app/config.py    ./app/config.py
+COPY api/app/database.py  ./app/database.py
+COPY api/app/workers/     ./app/workers/
+COPY api/app/models/      ./app/models/
+COPY api/app/services/    ./app/services/
 
 # /app/ml is mounted at runtime — no COPY needed.
 # The worker reads WEIGHTS_DIR=/app/ml/weights and WORKSPACE=/tmp/vton_workspace
-# from environment (set in docker-compose.gpu.yml).
+# from environment (set in docker-compose.gpu.yml). WORKSPACE, rembg's
+# ~/.u2net, and the HF/torch caches are all volume-backed there too, so
+# they survive container recreation instead of re-downloading each time.
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

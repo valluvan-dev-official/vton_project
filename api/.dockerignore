@@ -1,0 +1,10 @@
+# Build context for the lightweight api/Dockerfile (context: . — used by
+# the api and flower services in docker-compose.gpu.yml as of this change).
+# Keeps dev/test artifacts and bytecode caches out of the image.
+
+**/__pycache__/
+*.pyc
+.pytest_cache/
+_test_*.db
+.env
+.env.*

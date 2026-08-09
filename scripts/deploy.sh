@@ -6,6 +6,9 @@
 # `cd`-ed into the project root (PROJECT_DIR) before calling this script.
 #
 # Usage: scripts/deploy.sh [health_url]
+#        FORCE_WORKER_RESTART=1 scripts/deploy.sh   (force worker recreate
+#        regardless of what changed — e.g. the worker crashed and needs a
+#        restart even though no GPU-relevant file changed since last deploy)
 #
 # Layout on the server:
 #   PROJECT_DIR/            <- git root, current working directory on entry
@@ -17,15 +20,22 @@
 #     already `cd`-ed there) — never hardcoded.
 #   - Git operations (fetch/pull) run in PROJECT_DIR.
 #   - All `docker compose` commands run from PROJECT_DIR/api using
-#     -f docker-compose.gpu.yml explicitly, which builds api/Dockerfile.gpu
-#     (PyTorch + CUDA base image, requirements.txt + requirements-gpu.txt).
-#     The CPU-only docker-compose.yml / Dockerfile are never referenced.
+#     -f docker-compose.gpu.yml explicitly. api/flower build from the
+#     lightweight api/Dockerfile (CPU-only, no torch); only worker builds
+#     from api/Dockerfile.gpu (PyTorch + CUDA base image,
+#     requirements.txt + requirements-gpu.txt). The CPU-only
+#     docker-compose.yml is never referenced.
 #   - Pulls the latest code on whatever branch is currently checked out
 #     (the workflow only ever triggers on pushes to `ec2`, so that is
 #     always the branch in play).
 #   - Never runs `docker compose down` — only changed services are
 #     recreated via `docker compose up -d`, so postgres/redis are left
 #     running untouched unless their own config/image changed.
+#   - The GPU worker is only rebuilt+recreated when a GPU-relevant path
+#     changed since the last successful deploy (see "GPU-relevant change
+#     detection" below) — api/flower always deploy on every push. This is
+#     what lets a pure API/frontend/catalog change go out without
+#     restarting a worker that may have a model loaded in GPU RAM.
 #   - Never removes volumes or networks.
 #   - Exits non-zero (and leaves the current stack running) on any
 #     failure up through the build step. If the post-deploy health check
@@ -36,15 +46,28 @@ set -Eeuo pipefail
 
 HEALTH_URL="${1:-http://localhost:8000/health}"
 FALLBACK_HEALTH_URL="http://localhost:8000/docs"
-# Production always builds/runs the GPU stack (api/docker-compose.gpu.yml,
-# which builds api/Dockerfile.gpu). The plain "docker compose" invocation
-# would silently fall back to api/docker-compose.yml (CPU image, no
-# torch) since that's Compose's default file when no -f is given — so
-# the GPU file must always be named explicitly.
+# Production always builds/runs the GPU stack (api/docker-compose.gpu.yml).
+# The plain "docker compose" invocation would silently fall back to
+# api/docker-compose.yml (CPU image, no torch) since that's Compose's
+# default file when no -f is given — so the GPU file must always be named
+# explicitly.
 COMPOSE_FILE="docker-compose.gpu.yml"
 COMPOSE="docker compose -f $COMPOSE_FILE"
 HEALTH_RETRIES=10
 HEALTH_RETRY_DELAY=6
+FORCE_WORKER_RESTART="${FORCE_WORKER_RESTART:-0}"
+
+# Paths that mean "the GPU worker needs to be rebuilt/recreated" — the ML
+# pipeline itself, the GPU-specific inference plumbing, GPU dependencies/
+# image definition, or the compose file that configures the worker's
+# volumes/env/GPU device reservation. Deliberately NOT included: general
+# app/services/*, app/models/*, app/config.py — those ARE imported by the
+# worker too, but changes there (e.g. the shadow-mode fit_analysis/
+# garment_catalog code) are safe to reach the worker on its next
+# GPU-relevant deploy rather than forcing an immediate restart, since
+# nothing on that path can affect an in-flight or future render. Use
+# FORCE_WORKER_RESTART=1 to override this on any given deploy.
+GPU_RELEVANT_PATTERN='^ml/|^api/Dockerfile\.gpu$|^api/requirements-gpu\.txt$|^api/app/services/gpu_inference_service\.py$|^api/app/services/inference\.py$|^api/app/services/model_bootstrap\.py$|^api/app/workers/|^api/docker-compose\.gpu\.yml$'
 
 log()  { printf '\n[deploy] %s — %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1"; }
 fail() { log "FAILED: $1"; exit 1; }
@@ -62,6 +85,9 @@ trap 'fail "unexpected error at line $LINENO"' ERR
 # PROJECT_DIR is wherever the caller cd'ed to before invoking this script.
 PROJECT_DIR="$(pwd)"
 COMPOSE_DIR="$PROJECT_DIR/api"
+# Lives inside .git/ so it's part of the repo's local metadata, never
+# tracked, and never touched/conflicted by `git pull`.
+DEPLOY_STATE_FILE="$PROJECT_DIR/.git/vton-deploy-last-sha"
 
 git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || fail "$PROJECT_DIR is not a git repository"
@@ -71,12 +97,16 @@ if [[ ! -f "$COMPOSE_DIR/$COMPOSE_FILE" ]]; then
 fi
 
 BRANCH="$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD)"
+PREV_SHA=""
+[[ -f "$DEPLOY_STATE_FILE" ]] && PREV_SHA="$(cat "$DEPLOY_STATE_FILE" 2>/dev/null || true)"
 
 snapshot "before deployment"
 
-log "Step 1/6: Pulling latest code on branch '$BRANCH' in $PROJECT_DIR"
+log "Step 1/7: Pulling latest code on branch '$BRANCH' in $PROJECT_DIR"
 git -C "$PROJECT_DIR" fetch origin
 git -C "$PROJECT_DIR" pull origin "$BRANCH"
+
+NEW_SHA="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
 
 cd "$COMPOSE_DIR"
 log "Using compose directory: $COMPOSE_DIR (file: $COMPOSE_FILE)"
@@ -96,16 +126,56 @@ else
     log ".env already present at $PROJECT_DIR/.env — leaving as is"
 fi
 
-log "Step 2/6: Building project images (api, worker, flower only — postgres/redis/base images untouched)"
-if ! $COMPOSE build api worker flower; then
-    fail "docker compose build failed — running containers were NOT stopped or restarted"
+# ── GPU-relevant change detection ───────────────────────────────────────────
+log "Step 2/7: Determining whether the GPU worker needs to be recreated"
+GPU_RELEVANT=0
+if [[ "$FORCE_WORKER_RESTART" == "1" ]]; then
+    log "FORCE_WORKER_RESTART=1 — worker will be rebuilt/recreated regardless of changed files."
+    GPU_RELEVANT=1
+elif [[ -z "$PREV_SHA" ]]; then
+    log "No previous-deploy marker found ($DEPLOY_STATE_FILE) — treating this as a full deploy."
+    GPU_RELEVANT=1
+elif ! git -C "$PROJECT_DIR" cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
+    log "Previous-deploy marker '$PREV_SHA' is not a valid commit in this repo anymore — treating this as a full deploy."
+    GPU_RELEVANT=1
+elif [[ "$PREV_SHA" == "$NEW_SHA" ]]; then
+    log "HEAD unchanged since last deploy ($NEW_SHA) — no files changed, worker will not be recreated."
+else
+    CHANGED_FILES="$(git -C "$PROJECT_DIR" diff --name-only "$PREV_SHA" "$NEW_SHA")"
+    log "Files changed between $PREV_SHA and $NEW_SHA:"
+    echo "$CHANGED_FILES"
+    if echo "$CHANGED_FILES" | grep -Eq "$GPU_RELEVANT_PATTERN"; then
+        log "GPU-relevant path(s) changed — worker will be rebuilt/recreated."
+        GPU_RELEVANT=1
+    else
+        log "No GPU-relevant paths changed — worker will be left running untouched."
+    fi
+fi
+
+log "Step 3/7: Building project images (api, flower always; worker only if needed)"
+if ! $COMPOSE build api flower; then
+    fail "docker compose build (api, flower) failed — running containers were NOT stopped or restarted"
+fi
+# Always attempt the worker build too, even when GPU_RELEVANT=0: with
+# Dockerfile.gpu's COPY scoped to only worker-relevant paths, this is a
+# fast no-op via Docker's own layer cache whenever nothing worker-relevant
+# changed, and keeps a ready image available immediately in case a manual
+# FORCE_WORKER_RESTART is used later without a rebuild step.
+if ! $COMPOSE build worker; then
+    fail "docker compose build (worker) failed — running containers were NOT stopped or restarted"
 fi
 log "Build succeeded"
 
-log "Step 3/6: Recreating only changed services (no 'compose down' — postgres/redis stay up unless their config changed)"
-$COMPOSE up -d
+log "Step 4/7: Recreating changed services (no 'compose down' — postgres/redis stay up unless their config changed)"
+$COMPOSE up -d api flower
+if [[ "$GPU_RELEVANT" -eq 1 ]]; then
+    log "Recreating worker (--force-recreate — guarantees a fresh process even when only the ml/ bind mount changed, since that never changes the image itself)"
+    $COMPOSE up -d --force-recreate worker
+else
+    log "Skipping worker recreate — no GPU-relevant changes detected since the last deploy. The running worker (with its already-loaded GPU engine) is left untouched."
+fi
 
-log "Step 4/6: Verifying container status"
+log "Step 5/7: Verifying container status"
 sleep 5
 $COMPOSE ps
 
@@ -113,7 +183,7 @@ if $COMPOSE ps --format json 2>/dev/null | grep -q '"State":"exited"'; then
     fail "one or more containers exited after deployment — check 'docker compose logs'"
 fi
 
-log "Step 5/6: FastAPI health check ($HEALTH_URL, up to $HEALTH_RETRIES attempts)"
+log "Step 6/7: FastAPI health check ($HEALTH_URL, up to $HEALTH_RETRIES attempts)"
 healthy=0
 for attempt in $(seq 1 "$HEALTH_RETRIES"); do
     if curl -fsS -o /dev/null "$HEALTH_URL" || curl -fsS -o /dev/null "$FALLBACK_HEALTH_URL"; then
@@ -126,9 +196,14 @@ for attempt in $(seq 1 "$HEALTH_RETRIES"); do
 done
 [[ "$healthy" -eq 1 ]] || fail "FastAPI health check did not pass after $HEALTH_RETRIES attempts (new containers left running for inspection)"
 
-log "Step 6/6: Cleaning up unused images (volumes and networks are preserved)"
+# Only record this deploy as "done" once the health check has actually
+# passed — a failed deploy must not advance the marker, so the next run
+# still sees (and acts on) whatever GPU-relevant changes were in this push.
+echo "$NEW_SHA" > "$DEPLOY_STATE_FILE"
+
+log "Step 7/7: Cleaning up unused images (volumes and networks are preserved)"
 docker image prune -f
 
 snapshot "after deployment"
 
-log "Deployment summary: branch=$BRANCH compose_dir=$COMPOSE_DIR compose_file=$COMPOSE_FILE health_url=$HEALTH_URL status=SUCCESS"
+log "Deployment summary: branch=$BRANCH compose_dir=$COMPOSE_DIR compose_file=$COMPOSE_FILE health_url=$HEALTH_URL worker_recreated=$([[ $GPU_RELEVANT -eq 1 ]] && echo yes || echo no) status=SUCCESS"

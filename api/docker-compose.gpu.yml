@@ -1,10 +1,15 @@
 services:
 
   # ── FastAPI ────────────────────────────────────────────────────────────────
+  # Builds from the lightweight CPU-only api/Dockerfile, NOT Dockerfile.gpu —
+  # the API process only enqueues Celery jobs (task.delay()) and never runs
+  # GPU inference itself, so it needs no CUDA base image, torch, or diffusers.
+  # This also decouples its image from the worker's: an api/app/routes,
+  # schemas, or static/ change now only rebuilds this image, never worker's.
   api:
     build:
-      context: ..
-      dockerfile: api/Dockerfile.gpu
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     env_file: .env
@@ -53,6 +58,21 @@ services:
       # the host weights and make them invisible to the container.
       - ../storage:/app/storage
       - ../ml:/app/ml
+      # Persistent caches — named volumes survive container recreation
+      # (unlike the container's own writable layer), so a worker recreate
+      # no longer re-clones/re-downloads any of this from scratch:
+      #   - idm_vton_workspace: the IDM-VTON repo git-cloned by
+      #     gpu_inference.py's _ensure_repos() into WORKSPACE (below).
+      #   - rembg_cache: rembg's U2Net background-removal model, downloaded
+      #     to ~/.u2net (root's HOME is /root) on first use.
+      #   - hf_cache / torch_cache: default Hugging Face / torch hub cache
+      #     locations, in case any component reaches out for extra weights
+      #     (e.g. tokenizer/config metadata) beyond the local /app/ml/weights
+      #     checkpoints already used for the core IDM-VTON model loading.
+      - idm_vton_workspace:/tmp/vton_workspace
+      - rembg_cache:/root/.u2net
+      - hf_cache:/root/.cache/huggingface
+      - torch_cache:/root/.cache/torch
     deploy:
       resources:
         reservations:
@@ -86,11 +106,13 @@ services:
       start_period: 300s
       retries: 3
 
-  # ── Flower (Celery dashboard) ──────────────────────────────────────────────
+  # ── Flower (Celery dashboard) ────────────────────────────────────────────────
+  # Same lightweight image as api: flower only imports app.workers.tasks to
+  # read celery_app for monitoring — it never runs GPU inference either.
   flower:
     build:
-      context: ..
-      dockerfile: api/Dockerfile.gpu
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "5555:5555"
     env_file: .env
@@ -131,6 +153,10 @@ services:
 
 volumes:
   pg_data:
+  idm_vton_workspace:
+  rembg_cache:
+  hf_cache:
+  torch_cache:
 
 networks:
   default:

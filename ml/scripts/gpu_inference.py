@@ -16,6 +16,7 @@ import hashlib
 import subprocess
 import logging
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -180,6 +181,7 @@ class GPUInferenceEngine:
 
     def __init__(self, weights_dir: str, device: str = "cuda",
                  workspace: str = "/tmp/vton_workspace"):
+        _startup_t0 = time.perf_counter()
         self.device      = torch.device(device)
         self.weights_dir = Path(weights_dir)
         self.idm_path    = self.weights_dir / "idm_vton"
@@ -192,10 +194,15 @@ class GPUInferenceEngine:
         self._load_openpose()
         self._load_idm_pipeline()
         logger.info("GPUInferenceEngine (IDM-VTON): all models loaded.")
+        logger.info(
+            "GPU engine startup: TOTAL %.1fs (device=%s, workspace=%s)",
+            time.perf_counter() - _startup_t0, self.device, self.workspace,
+        )
 
     # ── Repo bootstrap ────────────────────────────────────────────────────────
 
     def _ensure_repos(self):
+        _t0 = time.perf_counter()
         repo_dir = self.workspace / "repos"
         repo_dir.mkdir(exist_ok=True)
 
@@ -233,21 +240,28 @@ class GPUInferenceEngine:
         _spec.loader.exec_module(_mod)
         self._get_mask_location = _mod.get_mask_location
 
+        logger.info("GPU engine startup: repo bootstrap took %.1fs", time.perf_counter() - _t0)
+
     # ── Model loading ─────────────────────────────────────────────────────────
 
     def _load_human_parser(self):
+        _t0 = time.perf_counter()
         from humanparsing.run_parsing import Parsing
         gpu_id = 0 if self.device.type == "cuda" else -1
         self._parser = Parsing(gpu_id)
         logger.info("Human parser (SCHP) loaded.")
+        logger.info("GPU engine startup: human parser (SCHP) load took %.1fs", time.perf_counter() - _t0)
 
     def _load_openpose(self):
+        _t0 = time.perf_counter()
         from openpose.run_openpose import OpenPose
         gpu_id = 0 if self.device.type == "cuda" else -1
         self._openpose = OpenPose(gpu_id)
         logger.info("OpenPose loaded.")
+        logger.info("GPU engine startup: OpenPose load took %.1fs", time.perf_counter() - _t0)
 
     def _load_idm_pipeline(self):
+        _t0 = time.perf_counter()
         from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
         from src.unet_hacked_garmnet import UNet2DConditionModel as GarmentUNet
         from src.unet_hacked_tryon import UNet2DConditionModel as TryonUNet
@@ -265,7 +279,9 @@ class GPUInferenceEngine:
             base, subfolder="unet_encoder", torch_dtype=torch.float16
         )
         unet_encoder.requires_grad_(False)
+        logger.info("GPU engine startup: UNet (tryon + garment encoder) load took %.1fs", time.perf_counter() - _t0)
 
+        _t1 = time.perf_counter()
         image_encoder = CLIPVisionModelWithProjection.from_pretrained(
             base, subfolder="image_encoder", torch_dtype=torch.float16
         )
@@ -304,6 +320,11 @@ class GPUInferenceEngine:
         _wrap_vae_dtype_safe(self._pipe.vae)
 
         logger.info("IDM-VTON pipeline loaded (unet=fp16, vae=fp32, dtype-safe VAE boundary active).")
+        logger.info(
+            "GPU engine startup: VAE/text-encoders/pipeline load took %.1fs",
+            time.perf_counter() - _t1,
+        )
+        logger.info("GPU engine startup: _load_idm_pipeline total %.1fs", time.perf_counter() - _t0)
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
 
