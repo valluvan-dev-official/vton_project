@@ -338,6 +338,21 @@ class GlassesOverlayEngine:
             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0),
         )
 
+        # Thin, delicate accessories (rimless/wire-frame glasses, fine
+        # temple arms) are mostly anti-aliased edge pixels with PARTIAL
+        # alpha to begin with. Warping (especially the scale-up from a
+        # small accessory photo onto a much larger face) interpolates those
+        # already-faint edges even further toward transparent, so the
+        # result reads as "the glasses are barely there" even though
+        # placement/rotation is correct — confirmed visually: faint traces
+        # in roughly the right position, not a wrong-position bug. Boost
+        # the warped alpha channel with a gamma curve (< 1) so partially
+        # transparent pixels become solidly visible, while fully
+        # transparent (0) and fully opaque (255) pixels are unaffected.
+        alpha = warped[:, :, 3].astype(np.float32) / 255.0
+        alpha = np.power(alpha, 0.45)
+        warped[:, :, 3] = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+
         person_rgba = Image.open(person_path).convert("RGBA")
         warped_pil = Image.fromarray(warped, mode="RGBA")
         person_rgba.alpha_composite(warped_pil)
