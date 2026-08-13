@@ -5,6 +5,19 @@ accelerate==0.28.0
 huggingface_hub==0.23.4
 numpy<2
 
+# Pinned here too, not just requirements.txt — Dockerfile.gpu runs
+# `pip install -r requirements.txt` and `pip install -r requirements-gpu.txt`
+# as two SEPARATE commands, so a pin in one file is invisible to the other's
+# dependency resolution. Something in this file's chain (most likely
+# detectron2, installed via git below, which commonly pulls in tensorboard)
+# has no upper bound on protobuf, so without repeating the pin here, this
+# second install silently upgrades protobuf past what mediapipe's compiled
+# proto definitions support (see requirements.txt's own comment for the
+# full explanation) — confirmed via `pip show protobuf` showing
+# Required-by: mediapipe, onnxruntime, tensorboard even after this exact
+# pin was already correctly applied by the first install.
+protobuf==4.25.3
+
 # Transformers + vision
 transformers==4.46.3
 einops
