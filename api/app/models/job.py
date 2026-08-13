@@ -25,6 +25,10 @@ class Job(Base):
     garment_image_path: Mapped[str] = mapped_column(String(512))            # primary (best-quality) garment image
     garment_image_paths: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list — all angles submitted
     garment_size: Mapped[str] = mapped_column(String(8), default="M")
+    # "upper_body" | "lower_body" | "dresses" — which body region get_mask_location()
+    # should target (see IDM-VTON's own get_mask_location signature). Defaults to
+    # upper_body so existing callers that don't send this yet keep prior behavior.
+    category: Mapped[str] = mapped_column(String(16), default="upper_body")
     person_size_estimate: Mapped[str | None] = mapped_column(String(8), nullable=True)
     result_image_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     quality_score: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -54,6 +58,7 @@ class Job(Base):
             "result_url": result_url,
             "quality_score": self.quality_score,
             "garment_size": self.garment_size,
+            "category": self.category,
             "person_size_estimate": self.person_size_estimate,
             "saved_as_training": self.saved_as_training,
             "user_consent": self.user_consent,

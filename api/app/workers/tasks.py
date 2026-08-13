@@ -342,7 +342,8 @@ def _resolve_local_path(s3_key_or_path: str, job_id: str, role: str) -> str:
 @celery_app.task(bind=True, name="tasks.process_tryon_job", max_retries=2)
 def process_tryon_job(self, job_id: str, person_image_path: str,
                        garment_image_paths, garment_size: str = "M",
-                       height_cm=None, merchant=None, garment_sku=None):
+                       height_cm=None, merchant=None, garment_sku=None,
+                       category: str = "upper_body"):
     """
     Main try-on pipeline:
       1. Resolve input images (download from S3 if needed)
@@ -357,7 +358,9 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
 
     height_cm, merchant, garment_sku are optional and default to None so
     existing callers that invoke this task with an older, shorter
-    positional signature keep working unchanged.
+    positional signature keep working unchanged. category defaults to
+    "upper_body" for the same reason — that's the literal every job was
+    hardcoded to before this param existed.
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -390,12 +393,13 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
         # ── 2. Inference ──────────────────────────────────────────────────
         output_path = str(tmp_dir / f"{job_id}_output.jpg")
         logger.info(
-            "tasks: Starting inference for job %s (%d garment image(s), garment_size=%s)...",
-            job_id, len(local_garments), garment_size,
+            "tasks: Starting inference for job %s (%d garment image(s), garment_size=%s, category=%s)...",
+            job_id, len(local_garments), garment_size, category,
         )
         router = get_inference_router()
         router.run(
-            local_person, local_garments, output_path, job_id=job_id, garment_size=garment_size,
+            local_person, local_garments, output_path, job_id=job_id,
+            garment_size=garment_size, category=category,
         )
         person_size_estimate = router.last_person_size_estimate
         logger.info(
@@ -447,6 +451,74 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
 
     finally:
         # Clean up temp files created for S3-backend input downloads
+        for p in tmp_files:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+# ── Accessory (wrist/glasses) Celery task ───────────────────────────────────
+#
+# Deliberately separate from process_tryon_job above rather than a shared
+# task with branching — accessory jobs skip SSIM quality scoring,
+# training-pair auto-save, and fit_analysis entirely: those are all
+# diffusion-specific concerns (comparing a generative re-render against the
+# original, or garment-size-chart fit estimation) that don't apply to a
+# deterministic landmark-overlay composite. See app/services/accessory_engine.py.
+
+@celery_app.task(bind=True, name="tasks.process_accessory_job", max_retries=2)
+def process_accessory_job(self, job_id: str, person_image_path: str,
+                           accessory_image_path: str, accessory_type: str):
+    import logging
+    from app.services.accessory_engine import ACCESSORY_ENGINES, LandmarkNotDetectedError
+
+    logger = logging.getLogger(__name__)
+    tmp_files: list[str] = []
+
+    try:
+        _update_job(job_id, {"status": "processing"})
+
+        tmp_dir = Path(settings.LOCAL_STORAGE_PATH) / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        local_person = _resolve_local_path(person_image_path, job_id, "person")
+        local_accessory = _resolve_local_path(accessory_image_path, job_id, "accessory")
+        for p in (local_person, local_accessory):
+            if str(tmp_dir) in p:
+                tmp_files.append(p)
+
+        output_path = str(tmp_dir / f"{job_id}_output.jpg")
+        logger.info("tasks: Starting accessory inference for job %s (accessory_type=%s)...",
+                    job_id, accessory_type)
+
+        engine_factory = ACCESSORY_ENGINES.get(accessory_type)
+        if engine_factory is None:
+            raise ValueError(f"No engine registered for accessory_type={accessory_type!r}.")
+        engine = engine_factory()
+        engine.run(local_person, local_accessory, output_path)
+        logger.info("tasks: Accessory inference complete for job %s.", job_id)
+
+        result_s3_key = f"{settings.S3_PREFIX_OUTPUT}/{job_id}.jpg"
+        storage = get_storage()
+        storage.save(output_path, result_s3_key)
+        result_image_path = storage.url(result_s3_key)
+
+        _update_job(job_id, {
+            "status":            "completed",
+            "result_image_path": result_image_path,
+        })
+
+    except LandmarkNotDetectedError as exc:
+        # Not transient — retrying won't find a wrist that isn't in the
+        # photo. Fail immediately instead of burning 2 retries/60s.
+        _update_job(job_id, {"status": "failed", "error_message": str(exc)})
+
+    except Exception as exc:
+        _update_job(job_id, {"status": "failed", "error_message": str(exc)})
+        raise self.retry(exc=exc, countdown=15)
+
+    finally:
         for p in tmp_files:
             try:
                 Path(p).unlink(missing_ok=True)

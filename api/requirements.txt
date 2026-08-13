@@ -16,8 +16,25 @@ flower==2.0.1
 pillow==10.3.0
 scikit-image==0.23.2
 numpy==1.26.4
-opencv-python-headless==4.9.0.80
 rembg==2.0.57
+# Wrist/glasses accessory try-on (app/services/accessory_engine.py) — hand/face
+# landmark detection, CPU-only.
+#
+# No separate opencv-python-headless pin here (deliberately removed) —
+# mediapipe's own transitive dependency is opencv-contrib-python, and having
+# BOTH opencv distributions in one install is a real, known conflict: they
+# both ship files under the same `cv2/` import path, so pip installs both
+# but whichever lands second silently overwrites the first's files,
+# producing a non-deterministic final cv2 build. Rather than fight that,
+# opencv-contrib-python is the sole cv2 provider here — it's a strict
+# superset of opencv-python-headless's API (every call this codebase makes:
+# cv2.imread/cvtColor/dilate/erode/circle in ml/scripts/gpu_inference.py and
+# app/services/accessory_engine.py) still works unchanged. Its extra
+# GUI-capable build needs libgl1/libglib2.0-0 at the OS level, which both
+# api/Dockerfile and api/Dockerfile.gpu already install — nothing further
+# to add there. No GUI functions (cv2.imshow etc.) are called anywhere in
+# this codebase, so running in a headless container is unaffected.
+mediapipe==0.10.14
 
 # API
 python-multipart==0.0.9
