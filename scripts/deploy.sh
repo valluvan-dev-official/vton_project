@@ -60,14 +60,23 @@ FORCE_WORKER_RESTART="${FORCE_WORKER_RESTART:-0}"
 # Paths that mean "the GPU worker needs to be rebuilt/recreated" — the ML
 # pipeline itself, the GPU-specific inference plumbing, GPU dependencies/
 # image definition, or the compose file that configures the worker's
-# volumes/env/GPU device reservation. Deliberately NOT included: general
-# app/services/*, app/models/*, app/config.py — those ARE imported by the
-# worker too, but changes there (e.g. the shadow-mode fit_analysis/
+# volumes/env/GPU device reservation. Deliberately NOT included: app/
+# models/*, app/config.py, and most of app/services/* — those ARE imported
+# by the worker too, but changes there (e.g. the shadow-mode fit_analysis/
 # garment_catalog code) are safe to reach the worker on its next
 # GPU-relevant deploy rather than forcing an immediate restart, since
-# nothing on that path can affect an in-flight or future render. Use
-# FORCE_WORKER_RESTART=1 to override this on any given deploy.
-GPU_RELEVANT_PATTERN='^ml/|^api/Dockerfile\.gpu$|^api/requirements-gpu\.txt$|^api/app/services/gpu_inference_service\.py$|^api/app/services/inference\.py$|^api/app/services/model_bootstrap\.py$|^api/app/workers/|^api/docker-compose\.gpu\.yml$'
+# nothing on that path can affect an in-flight or future render.
+#
+# api/requirements.txt and app/services/accessory_engine.py were added
+# after two manual deploys in a row silently shipped a stale worker
+# container: requirements.txt carries the mediapipe/protobuf pins the
+# worker's accessory (wrist/glasses) inference depends on, and
+# accessory_engine.py is the render logic itself for those two engines —
+# both directly affect live render output, unlike the shadow-mode-only
+# services this exclusion list was originally written for. Use
+# FORCE_WORKER_RESTART=1 to override this on any given deploy regardless
+# of what the diff contains.
+GPU_RELEVANT_PATTERN='^ml/|^api/Dockerfile\.gpu$|^api/requirements\.txt$|^api/requirements-gpu\.txt$|^api/app/services/gpu_inference_service\.py$|^api/app/services/inference\.py$|^api/app/services/model_bootstrap\.py$|^api/app/services/accessory_engine\.py$|^api/app/workers/|^api/docker-compose\.gpu\.yml$'
 
 log()  { printf '\n[deploy] %s — %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1"; }
 fail() { log "FAILED: $1"; exit 1; }

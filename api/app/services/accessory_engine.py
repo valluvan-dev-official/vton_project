@@ -34,7 +34,23 @@ class WristOverlayEngine:
     INDEX_MCP = 5
     PINKY_MCP = 17
 
-    def __init__(self, min_detection_confidence: float = 0.5):
+    # Raised from MediaPipe's own default (0.5) — a hand tucked in a pocket
+    # with only a sliver of fingers visible was still clearing 0.5 and
+    # producing a garbage detection (tiny knuckle span -> comically small
+    # watch, placed on whatever fragment was actually visible instead of a
+    # real wrist). 0.75 filters out these partial/occluded detections;
+    # combined with the handedness-score check and the width sanity check
+    # below, this is a first-pass threshold, not empirically tuned against
+    # a real dataset of hand photos — expect to revisit if it starts
+    # rejecting genuinely-visible wrists too.
+    MIN_HAND_CONFIDENCE = 0.75
+    # A knuckle span narrower than this fraction of the photo's width can't
+    # be a real, fully-visible hand in a normal portrait framing — it's a
+    # sign the detector only found a small fragment (fingertips peeking out
+    # of a pocket/sleeve, not an actual exposed wrist).
+    MIN_WRIST_WIDTH_FRACTION = 0.03
+
+    def __init__(self, min_detection_confidence: float = MIN_HAND_CONFIDENCE):
         self._min_confidence = min_detection_confidence
         self._hands = None  # lazy-init — loading the model isn't free
 
@@ -49,12 +65,26 @@ class WristOverlayEngine:
         return self._hands
 
     def detect_wrist(self, person_bgr: np.ndarray):
-        """Returns (wrist_xy, forearm_angle_deg, wrist_width_px) or None if no hand found."""
+        """Returns (wrist_xy, forearm_angle_deg, wrist_width_px) or None if
+        no hand found, or if what was found doesn't look like a genuinely
+        visible wrist (low handedness confidence, or an implausibly narrow
+        knuckle span — see MIN_WRIST_WIDTH_FRACTION)."""
         h, w = person_bgr.shape[:2]
         rgb = cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB)
         result = self._get_hands().process(rgb)
         if not result.multi_hand_landmarks:
             return None
+
+        # multi_handedness carries the model's own confidence for this
+        # specific detection — a stricter, explicit check on top of the
+        # min_detection_confidence gate already configured above, so we can
+        # log/tune this threshold independently of the model's internal one.
+        if result.multi_handedness:
+            score = result.multi_handedness[0].classification[0].score
+            if score < self.MIN_HAND_CONFIDENCE:
+                logger.info("Wrist detection rejected: handedness score %.2f below threshold %.2f",
+                            score, self.MIN_HAND_CONFIDENCE)
+                return None
 
         lm = result.multi_hand_landmarks[0].landmark
 
@@ -78,6 +108,11 @@ class WristOverlayEngine:
         knuckle_span = float(np.linalg.norm(index_mcp - pinky_mcp))
         wrist_width_px = knuckle_span * 0.75
 
+        if knuckle_span < w * self.MIN_WRIST_WIDTH_FRACTION:
+            logger.info("Wrist detection rejected: knuckle span %.0fpx too narrow for a %dpx-wide photo "
+                        "(likely a partial/occluded hand, not a genuinely visible wrist)", knuckle_span, w)
+            return None
+
         return wrist, angle_deg, wrist_width_px
 
     def validate(self, person_path: str) -> tuple[bool, str | None]:
@@ -86,7 +121,8 @@ class WristOverlayEngine:
         if person_bgr is None:
             return False, "This photo couldn't be read — please choose a different one."
         if self.detect_wrist(person_bgr) is None:
-            return False, "No wrist visible in this photo — try a photo showing your hand/wrist clearly."
+            return False, ("No wrist clearly visible in this photo — try a photo with your hand and "
+                            "wrist fully visible, not in a pocket or covered by a sleeve.")
         return True, None
 
     def run(self, person_path: str, accessory_path: str, output_path: str) -> None:
@@ -105,7 +141,10 @@ class WristOverlayEngine:
 
         detection = self.detect_wrist(person_bgr)
         if detection is None:
-            raise LandmarkNotDetectedError("No wrist/hand detected in this photo.")
+            raise LandmarkNotDetectedError(
+                "No wrist clearly visible in this photo — try a photo with your hand and wrist "
+                "fully visible, not in a pocket or covered by a sleeve."
+            )
         wrist_xy, angle_deg, wrist_width_px = detection
 
         accessory = Image.open(accessory_path).convert("RGBA")
@@ -147,7 +186,21 @@ def get_wrist_engine() -> WristOverlayEngine:
 
 
 class GlassesOverlayEngine:
-    """Glasses placement via MediaPipe Face Mesh landmarks."""
+    """
+    Glasses placement via MediaPipe Face Mesh landmarks.
+
+    Uses a full affine warp (cv2.warpAffine) derived from a 3-point
+    correspondence — both outer eye corners + the nose bridge — rather than
+    a rigid rotate+scale+paste. A pure rotate+scale (a "similarity"
+    transform: uniform scale, one rotation angle, translate — 4 degrees of
+    freedom) can only correct for in-plane head TILT (roll). It cannot
+    express the SHEAR that a turned head (yaw) or an off-angle accessory
+    product photo introduces, which is what made earlier output look like
+    the glasses were simply pasted on flat regardless of the photo's
+    geometry. An affine transform (6 DOF: adds shear + independent
+    horizontal/vertical scale) captures that, derived directly from where
+    the accessory's own lens/bridge points need to land on the face.
+    """
 
     # MediaPipe Face Mesh landmark indices (468-point topology).
     RIGHT_EYE_OUTER = 33    # subject's right eye, outer corner (camera-left side of frame)
@@ -169,8 +222,14 @@ class GlassesOverlayEngine:
             )
         return self._face_mesh
 
-    def detect_face(self, person_bgr: np.ndarray):
-        """Returns (anchor_xy, roll_angle_deg, glasses_width_px) or None if no face found."""
+    def detect_face_points(self, person_bgr: np.ndarray):
+        """
+        Returns (image_left_eye_xy, image_right_eye_xy, nose_bridge_xy) in
+        person-image pixel coordinates, or None if no face found.
+        "left"/"right" here mean image-left/image-right (camera view) —
+        the same convention the accessory product photo is naturally laid
+        out in — not anatomical left/right.
+        """
         h, w = person_bgr.shape[:2]
         rgb = cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB)
         result = self._get_face_mesh().process(rgb)
@@ -180,36 +239,63 @@ class GlassesOverlayEngine:
         lm = result.multi_face_landmarks[0].landmark
 
         def pt(i):
-            return np.array([lm[i].x * w, lm[i].y * h])
+            return (lm[i].x * w, lm[i].y * h)
 
-        right_eye = pt(self.RIGHT_EYE_OUTER)
-        left_eye = pt(self.LEFT_EYE_OUTER)
+        image_left_eye = pt(self.RIGHT_EYE_OUTER)    # camera-left side of frame
+        image_right_eye = pt(self.LEFT_EYE_OUTER)    # camera-right side of frame
         nose_bridge = pt(self.NOSE_BRIDGE)
+        return image_left_eye, image_right_eye, nose_bridge
 
-        # Roll: angle of the line between the two outer eye corners — how
-        # much the head is tilted in-plane. Glasses rotate to match.
-        direction = left_eye - right_eye
-        angle_deg = float(np.degrees(np.arctan2(direction[1], direction[0])))
+    @staticmethod
+    def _derive_accessory_anchor_points(accessory_rgba: np.ndarray):
+        """
+        Derives (image_left_point, image_right_point, top_center_point)
+        directly from the accessory's OWN alpha-channel silhouette, instead
+        of assuming every product photo is framed the same way. Real
+        product photos vary a lot in crop/framing (a full frontal shot vs.
+        a close-up on the hinge/bridge area, different padding, etc.) — a
+        fixed fraction like "(0.22, 0.50) is always the left lens" only
+        happens to be right for one specific framing and warps badly
+        (stretching whatever content actually sits at that fraction) on
+        anything cropped differently. This instead measures the actual
+        non-transparent content: left/right anchors are the centroid of
+        each half of the silhouette (split at its horizontal midpoint),
+        and the top anchor is the topmost non-transparent pixel within the
+        central band — which for a glasses cutout is the bridge regardless
+        of how tightly or loosely the photo is cropped.
+        """
+        alpha = accessory_rgba[:, :, 3]
+        ys, xs = np.nonzero(alpha > 10)
+        if len(xs) == 0:
+            raise ValueError("Accessory image has no visible (non-transparent) content.")
 
-        # Width: eye-to-eye span scaled up — glasses extend past both eyes
-        # to the temples. This ratio (1.9) is a first-pass estimate, not
-        # empirically calibrated — same caveat as wrist_width_px above,
-        # expect to tune once real photos run through this.
-        eye_span = float(np.linalg.norm(left_eye - right_eye))
-        glasses_width_px = eye_span * 1.9
+        x_min, x_max = float(xs.min()), float(xs.max())
+        y_min = float(ys.min())
+        mid_x = (x_min + x_max) / 2
 
-        # Anchor: horizontally centered between the eyes, vertically at the
-        # nose bridge (glasses sit ON the nose bridge, not at eye height).
-        anchor = np.array([(right_eye[0] + left_eye[0]) / 2, nose_bridge[1]])
+        left_side = xs < mid_x
+        right_side = ~left_side
+        left_point = (
+            (float(xs[left_side].mean()), float(ys[left_side].mean()))
+            if left_side.any() else (x_min, (y_min + float(ys.max())) / 2)
+        )
+        right_point = (
+            (float(xs[right_side].mean()), float(ys[right_side].mean()))
+            if right_side.any() else (x_max, (y_min + float(ys.max())) / 2)
+        )
 
-        return anchor, angle_deg, glasses_width_px
+        span = x_max - x_min
+        central_band = (xs > mid_x - span * 0.15) & (xs < mid_x + span * 0.15)
+        top_point = (mid_x, float(ys[central_band].min())) if central_band.any() else (mid_x, y_min)
+
+        return left_point, right_point, top_point
 
     def validate(self, person_path: str) -> tuple[bool, str | None]:
         """Fast pre-flight check — no compositing, just "can we find a face here."""
         person_bgr = cv2.imread(person_path)
         if person_bgr is None:
             return False, "This photo couldn't be read — please choose a different one."
-        if self.detect_face(person_bgr) is None:
+        if self.detect_face_points(person_bgr) is None:
             return False, "No face detected in this photo — try a clearer, front-facing photo."
         return True, None
 
@@ -226,37 +312,41 @@ class GlassesOverlayEngine:
         if person_bgr is None:
             raise ValueError(f"Could not read person image: {person_path}")
 
-        detection = self.detect_face(person_bgr)
-        if detection is None:
+        points = self.detect_face_points(person_bgr)
+        if points is None:
             raise LandmarkNotDetectedError("No face detected in this photo.")
-        anchor_xy, angle_deg, glasses_width_px = detection
+        image_left_eye, image_right_eye, nose_bridge = points
 
         accessory = Image.open(accessory_path).convert("RGBA")
-        # Fit the accessory's own aspect ratio to the detected glasses width —
-        # width drives the scale, height follows proportionally.
-        scale = glasses_width_px / accessory.width
-        new_w = max(1, int(accessory.width * scale))
-        new_h = max(1, int(accessory.height * scale))
-        accessory_resized = accessory.resize((new_w, new_h), Image.LANCZOS)
+        accessory_np = np.array(accessory)  # H x W x 4 (RGBA)
 
-        # Rotate to match head roll. Glasses product photos are typically
-        # shot level/upright (no rotate() offset needed the way the wrist
-        # band image needs a -90deg axis correction), so align directly with
-        # the measured roll angle.
-        accessory_rotated = accessory_resized.rotate(
-            -angle_deg, expand=True, resample=Image.BICUBIC,
+        accessory_left, accessory_right, accessory_top = self._derive_accessory_anchor_points(accessory_np)
+        src_pts = np.float32([accessory_left, accessory_right, accessory_top])
+        dst_pts = np.float32([image_left_eye, image_right_eye, nose_bridge])
+
+        # Full affine transform derived directly from these 3
+        # correspondences — captures rotation, scale, AND shear together,
+        # so a turned/tilted head (or an accessory photo that isn't
+        # perfectly frontal) warps the glasses to actually fit the face
+        # geometry instead of pasting a rigid, uniformly-scaled cutout.
+        M = cv2.getAffineTransform(src_pts, dst_pts)
+
+        person_h, person_w = person_bgr.shape[:2]
+        warped = cv2.warpAffine(
+            accessory_np, M, (person_w, person_h),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0),
         )
 
         person_rgba = Image.open(person_path).convert("RGBA")
-        paste_x = int(anchor_xy[0] - accessory_rotated.width / 2)
-        paste_y = int(anchor_xy[1] - accessory_rotated.height / 2)
-        person_rgba.alpha_composite(accessory_rotated, (paste_x, paste_y))
+        warped_pil = Image.fromarray(warped, mode="RGBA")
+        person_rgba.alpha_composite(warped_pil)
 
         person_rgba.convert("RGB").save(output_path, "JPEG", quality=95)
         logger.info(
-            "Glasses overlay: placed accessory at (%.0f, %.0f), angle=%.1f deg, "
-            "width=%.0fpx -> %s",
-            anchor_xy[0], anchor_xy[1], angle_deg, glasses_width_px, output_path,
+            "Glasses overlay: affine-warped accessory anchors=%s/%s/%s -> face eyes=%s/%s, bridge=%s -> %s",
+            accessory_left, accessory_right, accessory_top,
+            image_left_eye, image_right_eye, nose_bridge, output_path,
         )
 
 
