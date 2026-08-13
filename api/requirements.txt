@@ -35,6 +35,16 @@ rembg==2.0.57
 # to add there. No GUI functions (cv2.imshow etc.) are called anywhere in
 # this codebase, so running in a headless container is unaffected.
 mediapipe==0.10.14
+# Explicit pin, not previously present — mediapipe ships protobuf message
+# definitions compiled against protobuf's older C++/upb ABI. Left
+# unpinned, pip's resolver can land on protobuf 5.x (pulled in
+# transitively by another package, or just mediapipe's own loose upper
+# bound), which breaks mediapipe's compiled .pbtxt graph configs with
+# "google._upb._message.FieldDescriptor object has no attribute 'label'"
+# at runtime — a known, symptom-specific mediapipe/protobuf incompatibility,
+# not a bug in this codebase. 4.25.3 is a verified-compatible pairing with
+# mediapipe 0.10.x.
+protobuf==4.25.3
 
 # API
 python-multipart==0.0.9
