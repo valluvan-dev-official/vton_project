@@ -180,12 +180,16 @@ def get_gpu_engine():
 
 
 def run(person_path: str, garment_paths, output_path: str,
-        job_id: str = "", garment_size: str = "M") -> str:
+        job_id: str = "", garment_size: str = "M", category: str = "upper_body") -> str:
     """Convenience module-level function — mirror of GPUInferenceEngine.run().
 
     garment_paths may be a single path (str) or a list of paths — multiple
     photos of the same garment from different angles/zoom levels. The engine
     auto-picks the clearest one for inference.
+
+    category: "upper_body" | "lower_body" | "dresses" — threaded through to
+    GPUInferenceEngine.run() / get_mask_location(). Defaults to "upper_body",
+    the literal every job was hardcoded to before this param existed.
 
     Ensures the output directory exists before delegating to the singleton
     engine so callers do not need to create it themselves.  Returns the
@@ -195,5 +199,5 @@ def run(person_path: str, garment_paths, output_path: str,
         garment_paths = [garment_paths]
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     engine = get_gpu_engine()
-    engine.run(person_path, garment_paths, output_path, job_id=job_id, garment_size=garment_size)
+    engine.run(person_path, garment_paths, output_path, job_id=job_id, garment_size=garment_size, category=category)
     return engine.last_person_size_estimate

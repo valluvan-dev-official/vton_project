@@ -35,7 +35,60 @@
       padding: 40px 24px;
       display: flex;
       flex-direction: column;
-      gap: 32px;
+      gap: 28px;
+    }
+
+    /* Mode switch — segmented control. Two mutually exclusive test flows
+       (garment diffusion vs. CPU accessory overlay) share this one page
+       rather than being duplicated across two files, so the visual weight
+       of "which mode am I in" has to read instantly. */
+    .mode-switch {
+      display: inline-flex;
+      align-self: flex-start;
+      background: #161616;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 4px;
+      gap: 4px;
+    }
+    .mode-btn {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: #888;
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 9px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .mode-btn:hover { color: #ccc; }
+    .mode-btn.active {
+      background: linear-gradient(135deg, #2d6a4f, #3a8a5c);
+      color: #fff;
+    }
+    .mode-btn .dot {
+      width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: 0.6;
+    }
+
+    .section-label {
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+      color: #666;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-label::before {
+      content: '';
+      width: 6px; height: 6px; border-radius: 50%;
+      background: #3a8a5c;
     }
 
     /* Upload section */
@@ -58,13 +111,23 @@
       transition: border-color 0.2s, background 0.2s;
       position: relative;
     }
-    .size-row { display: flex; align-items: center; gap: 10px; }
-    .size-row label { font-size: 0.85rem; color: #aaa; }
-    .size-row select {
-      background: #161616; color: #e8e8e8; border: 1px solid #333;
-      border-radius: 8px; padding: 6px 10px; font-size: 0.85rem;
+    .options-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 24px;
+      background: #131313;
+      border: 1px solid #232323;
+      border-radius: 12px;
+      padding: 16px 18px;
     }
-    .size-hint { font-size: 0.75rem; color: #666; }
+    .option-field { display: flex; flex-direction: column; gap: 6px; }
+    .option-field label { font-size: 0.78rem; font-weight: 600; color: #aaa; }
+    .option-field select {
+      background: #161616; color: #e8e8e8; border: 1px solid #333;
+      border-radius: 8px; padding: 8px 12px; font-size: 0.85rem; min-width: 160px;
+    }
+    .option-hint { font-size: 0.72rem; color: #666; max-width: 260px; line-height: 1.5; }
 
     .upload-card:hover { border-color: #555; background: #1c1c1c; }
     .upload-card.has-image { border-style: solid; border-color: #3a8a5c; }
@@ -75,7 +138,7 @@
 
     .upload-icon { font-size: 2.2rem; }
     .upload-label { font-size: 0.9rem; font-weight: 600; }
-    .upload-hint { font-size: 0.75rem; color: #666; }
+    .upload-hint { font-size: 0.75rem; color: #666; text-align: center; }
 
     .preview-img {
       width: 100%;
@@ -193,7 +256,7 @@
     }
     .error-box.visible { display: block; }
 
-    /* Fit estimate (Phase 1, optional/additive) */
+    /* Fit estimate (Phase 1, optional/additive) — garment mode only, see JS */
     .fit-card {
       background: #161616; border: 1px solid #2a2a2a; border-radius: 12px; padding: 16px 20px;
     }
@@ -218,9 +281,13 @@
     .fit-result td, .fit-result th { padding: 4px 8px; text-align: left; font-size: 0.78rem; border-bottom: 1px solid #222; }
     .fit-disclaimer { font-size: 0.68rem; color: #555; }
 
+    [data-mode-only] { display: none; }
+    [data-mode-only].visible { display: flex; }
+
     @media (max-width: 600px) {
       .upload-row { grid-template-columns: 1fr; }
       .result-grid { grid-template-columns: 1fr 1fr; }
+      .options-row { flex-direction: column; gap: 14px; }
     }
   </style>
 </head>
@@ -228,10 +295,20 @@
 
 <header>
   <h1>Virtual Try-On</h1>
-  <span>DCI-VTON · SageMaker GPU</span>
+  <span id="engine-badge">DCI-VTON · SageMaker GPU</span>
 </header>
 
 <main>
+
+  <!-- Mode switch -->
+  <div class="mode-switch" role="tablist" aria-label="Try-on test mode">
+    <button type="button" class="mode-btn active" id="mode-garment" role="tab" aria-selected="true">
+      <span class="dot"></span>Garment Try-On
+    </button>
+    <button type="button" class="mode-btn" id="mode-accessory" role="tab" aria-selected="false">
+      <span class="dot"></span>Accessory Try-On
+    </button>
+  </div>
 
   <!-- Upload -->
   <div class="upload-row">
@@ -245,28 +322,51 @@
 
     <div class="upload-card" id="card-garment">
       <input type="file" id="input-garment" accept="image/jpeg,image/png" multiple />
-      <div class="upload-icon">👕</div>
-      <div class="upload-label">Garment Photos</div>
-      <div class="upload-hint">Same garment, multiple angles · JPG/PNG · max 10MB each, up to 6</div>
+      <div class="upload-icon" id="card-garment-icon">👕</div>
+      <div class="upload-label" id="card-garment-label">Garment Photos</div>
+      <div class="upload-hint" id="card-garment-hint">Same garment, multiple angles · JPG/PNG · max 10MB each, up to 6</div>
       <img class="preview-img" id="preview-garment" alt="garment preview" />
     </div>
   </div>
 
-  <div class="size-row">
-    <label for="select-garment-size">Garment size</label>
-    <select id="select-garment-size">
-      <option value="S">S</option>
-      <option value="M" selected>M</option>
-      <option value="L">L</option>
-      <option value="XL">XL</option>
-      <option value="XXL">XXL</option>
-    </select>
-    <span class="size-hint">Person's size is detected automatically from the photo.</span>
+  <!-- Garment mode options -->
+  <div class="options-row" id="panel-garment" data-mode-only>
+    <div class="option-field">
+      <label for="select-category">Body region (category)</label>
+      <select id="select-category">
+        <option value="upper_body" selected>Upper Body</option>
+        <option value="lower_body">Lower Body</option>
+        <option value="dresses">Dress / Full Body</option>
+      </select>
+    </div>
+    <div class="option-field">
+      <label for="select-garment-size">Garment size</label>
+      <select id="select-garment-size">
+        <option value="S">S</option>
+        <option value="M" selected>M</option>
+        <option value="L">L</option>
+        <option value="XL">XL</option>
+        <option value="XXL">XXL</option>
+      </select>
+    </div>
+    <div class="option-hint">Person's body size is detected automatically from the photo — category tells the model which region (top/bottom/dress) to fit the garment onto.</div>
   </div>
 
-  <!-- Body-shape / fit estimate (Phase 1, optional, additive) — does not
-       affect the try-on flow above; it's a separate, independent request. -->
-  <details class="fit-card" id="fit-card">
+  <!-- Accessory mode options -->
+  <div class="options-row" id="panel-accessory" data-mode-only>
+    <div class="option-field">
+      <label for="select-accessory-type">Accessory type</label>
+      <select id="select-accessory-type">
+        <option value="wrist" selected>Wrist (watch / bracelet)</option>
+        <option value="glasses">Glasses</option>
+      </select>
+    </div>
+    <div class="option-hint">CPU landmark-overlay engine — completes in seconds, not GPU diffusion. The accessory photo should already be background-removed.</div>
+  </div>
+
+  <!-- Body-shape / fit estimate (Phase 1, optional, additive; garment mode only) —
+       does not affect the try-on flow above; it's a separate, independent request. -->
+  <details class="fit-card" id="fit-card" data-mode-only>
     <summary class="fit-summary">Body measurements &amp; fit estimate (optional)</summary>
     <div class="fit-body">
       <div class="fit-grid">
@@ -310,7 +410,7 @@
       </div>
       <div class="result-item">
         <img id="result-garment" alt="garment" />
-        <span>Garment</span>
+        <span id="result-garment-caption">Garment</span>
       </div>
       <div class="result-item">
         <img id="result-output" alt="result" />
@@ -323,6 +423,63 @@
 </main>
 
 <script>
+  // ── Mode state ────────────────────────────────────────────────────────────
+  // "garment" -> POST /api/v1/tryon (GPU diffusion, category-aware)
+  // "accessory" -> POST /api/v1/accessory-tryon (CPU landmark overlay)
+  let mode = 'garment';
+
+  const modeGarmentBtn   = document.getElementById('mode-garment');
+  const modeAccessoryBtn = document.getElementById('mode-accessory');
+  const panelGarment     = document.getElementById('panel-garment');
+  const panelAccessory   = document.getElementById('panel-accessory');
+  const fitCard          = document.getElementById('fit-card');
+  const engineBadge      = document.getElementById('engine-badge');
+  const cardGarmentIcon  = document.getElementById('card-garment-icon');
+  const cardGarmentLabel = document.getElementById('card-garment-label');
+  const cardGarmentHint  = document.getElementById('card-garment-hint');
+  const resultGarmentCaption = document.getElementById('result-garment-caption');
+
+  function setMode(next) {
+    mode = next;
+    const isGarment = mode === 'garment';
+
+    modeGarmentBtn.classList.toggle('active', isGarment);
+    modeGarmentBtn.setAttribute('aria-selected', String(isGarment));
+    modeAccessoryBtn.classList.toggle('active', !isGarment);
+    modeAccessoryBtn.setAttribute('aria-selected', String(!isGarment));
+
+    panelGarment.classList.toggle('visible', isGarment);
+    panelAccessory.classList.toggle('visible', !isGarment);
+    fitCard.classList.toggle('visible', isGarment);
+
+    inputGarment.multiple = isGarment;
+    if (isGarment) {
+      engineBadge.textContent = 'DCI-VTON · SageMaker GPU';
+      cardGarmentIcon.textContent = '👕';
+      cardGarmentLabel.textContent = 'Garment Photos';
+      cardGarmentHint.textContent = 'Same garment, multiple angles · JPG/PNG · max 10MB each, up to 6';
+      resultGarmentCaption.textContent = 'Garment';
+    } else {
+      engineBadge.textContent = 'MediaPipe · CPU Overlay';
+      cardGarmentIcon.textContent = '⌚';
+      cardGarmentLabel.textContent = 'Accessory Photo';
+      cardGarmentHint.textContent = 'Background-removed cutout · JPG/PNG · max 10MB';
+      resultGarmentCaption.textContent = 'Accessory';
+    }
+
+    // Switching modes clears the second upload (garment vs. accessory files
+    // aren't interchangeable) but keeps the person photo — no reason to
+    // re-upload the same person shot when only testing a different engine.
+    garmentFiles = [];
+    previewG.src = '';
+    cardGarment.classList.remove('has-image');
+    checkReady();
+  }
+
+  modeGarmentBtn.addEventListener('click', () => setMode('garment'));
+  modeAccessoryBtn.addEventListener('click', () => setMode('accessory'));
+
+  // ── Shared upload/status/result wiring ──────────────────────────────────
   const inputPerson  = document.getElementById('input-person');
   const inputGarment = document.getElementById('input-garment');
   const cardPerson   = document.getElementById('card-person');
@@ -422,10 +579,7 @@
     }
   }
 
-  // ── Body-shape / fit estimate (Phase 1, optional, additive) ──────────────
-  // Fully independent of the try-on submit flow above: separate button,
-  // separate request, separate result area. Leaving all fields blank and
-  // never pressing "Check fit" leaves the existing try-on flow untouched.
+  // ── Body-shape / fit estimate (Phase 1, optional, additive; garment mode only) ──
   const btnFit    = document.getElementById('btn-fit-estimate');
   const fitResult = document.getElementById('fit-result');
 
@@ -485,6 +639,7 @@
     }
   });
 
+  // ── Submit — branches by mode, shares the status/poll/result UI below ───
   btnSubmit.addEventListener('click', async () => {
     errorBox.classList.remove('visible');
     resultSec.classList.remove('visible');
@@ -493,21 +648,32 @@
 
     setBadge('pending');
     statusLabel.textContent = 'Submitting job...';
-    setProgress(5, 'Uploading images...', 'Estimated time: ~3 minutes');
+    const isGarment = mode === 'garment';
+    setProgress(5, 'Uploading images...', isGarment ? 'Estimated time: ~3 minutes' : 'Estimated time: a few seconds');
 
     const fd = new FormData();
     fd.append('person_image', personFile);
-    garmentFiles.forEach(f => fd.append('garment_images', f));
-    fd.append('garment_size', document.getElementById('select-garment-size').value);
+
+    let endpoint;
+    if (isGarment) {
+      endpoint = '/api/v1/tryon';
+      garmentFiles.forEach(f => fd.append('garment_images', f));
+      fd.append('garment_size', document.getElementById('select-garment-size').value);
+      fd.append('category', document.getElementById('select-category').value);
+    } else {
+      endpoint = '/api/v1/accessory-tryon';
+      fd.append('accessory_image', garmentFiles[0]);
+      fd.append('accessory_type', document.getElementById('select-accessory-type').value);
+    }
 
     let jobId;
     try {
-      const res = await fetch('/api/v1/tryon', { method: 'POST', body: fd });
+      const res = await fetch(endpoint, { method: 'POST', body: fd });
       if (!res.ok) {
         const body = await parseErrorResponse(res);
         const msg = formatApiErrorBody(body) || res.statusText || 'Submission failed';
         console.error('Try-on submission failed', {
-          url: '/api/v1/tryon',
+          url: endpoint,
           status: res.status,
           statusText: res.statusText,
           body,
@@ -529,29 +695,38 @@
     }
 
     setBadge('processing');
-    statusLabel.textContent = 'Processing on SageMaker GPU...';
-    setProgress(15, 'Inference job starting...', 'Estimated time: ~2-3 minutes');
+    statusLabel.textContent = isGarment ? 'Processing on SageMaker GPU...' : 'Running landmark overlay (CPU)...';
+    setProgress(15, isGarment ? 'Inference job starting...' : 'Detecting landmarks...',
+      isGarment ? 'Estimated time: ~2-3 minutes' : 'Estimated time: a few seconds');
 
-    // Poll every 10 seconds
+    // Poll every 3s for accessory jobs (fast CPU), 10s for garment (slow GPU) —
+    // no reason to poll a multi-second accessory job on a 10s cadence.
+    const pollMs = isGarment ? 10000 : 3000;
     let elapsed = 0;
     pollInterval = setInterval(async () => {
-      elapsed += 10;
+      elapsed += pollMs / 1000;
       try {
         const res  = await fetch(`/api/v1/status/${jobId}`);
         const data = await res.json();
         const st   = data.status;
 
         if (st === 'processing') {
-          const pct = Math.min(15 + (elapsed / 180) * 75, 88);
-          setBadge('processing');
-          setProgress(pct,
-            elapsed < 30  ? 'SegFormer segmentation running...' :
-            elapsed < 60  ? 'DensePose IUV extraction...' :
-            elapsed < 90  ? 'AFWM garment warping...' :
-            elapsed < 120 ? 'DCI diffusion inference (50 steps)...' :
-                            'Blending final result...',
-            `~${Math.max(0, Math.round((180 - elapsed) / 60))} min remaining`
-          );
+          if (isGarment) {
+            const pct = Math.min(15 + (elapsed / 180) * 75, 88);
+            setBadge('processing');
+            setProgress(pct,
+              elapsed < 30  ? 'SegFormer segmentation running...' :
+              elapsed < 60  ? 'DensePose IUV extraction...' :
+              elapsed < 90  ? 'AFWM garment warping...' :
+              elapsed < 120 ? 'DCI diffusion inference (50 steps)...' :
+                              'Blending final result...',
+              `~${Math.max(0, Math.round((180 - elapsed) / 60))} min remaining`
+            );
+          } else {
+            const pct = Math.min(15 + (elapsed / 8) * 75, 90);
+            setBadge('processing');
+            setProgress(pct, 'Compositing accessory onto photo...', 'Almost done...');
+          }
         } else if (st === 'completed') {
           clearInterval(pollInterval);
           setBadge('completed');
@@ -582,8 +757,13 @@
       } catch (e) {
         // network hiccup — keep polling
       }
-    }, 10000);
+    }, pollMs);
   });
+
+  // Initialize panel visibility on load (mirrors setMode('garment') without
+  // touching upload state that doesn't exist yet).
+  panelGarment.classList.add('visible');
+  fitCard.classList.add('visible');
 </script>
 </body>
 </html>

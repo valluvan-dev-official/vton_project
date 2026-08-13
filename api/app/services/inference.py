@@ -116,10 +116,16 @@ class InferenceRouter:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def run(self, person_image_path: str, garment_image_paths,
-            output_path: str, job_id: str = "", garment_size: str = "M") -> str:
+            output_path: str, job_id: str = "", garment_size: str = "M",
+            category: str = "upper_body") -> str:
         """garment_image_paths: a single path, or a list of paths (multiple
         angles of the same garment — only the local_gpu/IDM-VTON backend
         actually makes use of more than one; other backends use the first).
+
+        category: "upper_body" | "lower_body" | "dresses" — only the
+        local_gpu/IDM-VTON backend acts on this (threaded into
+        get_mask_location()); other backends (own model, placeholder,
+        SageMaker) ignore it, same as before this param existed.
 
         Returns output_path. The auto-detected person body-size bucket (when
         available) is left on self.last_person_size_estimate for the caller
@@ -130,6 +136,7 @@ class InferenceRouter:
         if isinstance(garment_image_paths, str):
             garment_image_paths = [garment_image_paths]
         garment_size = (garment_size or "M").strip().upper()
+        category = (category or "upper_body").strip().lower()
         job_id = job_id or Path(output_path).stem
 
         clean_garment_paths = [self._preprocess_garment(p) for p in garment_image_paths]
@@ -152,7 +159,7 @@ class InferenceRouter:
                 from app.services.gpu_inference_service import run as _gpu_run
                 self.last_person_size_estimate = _gpu_run(
                     person_image_path, clean_garment_paths, output_path,
-                    job_id=job_id, garment_size=garment_size,
+                    job_id=job_id, garment_size=garment_size, category=category,
                 )
                 return output_path
             except Exception as exc:

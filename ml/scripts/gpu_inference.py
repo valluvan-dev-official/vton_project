@@ -534,12 +534,18 @@ class GPUInferenceEngine:
     # ── Agnostic mask ─────────────────────────────────────────────────────────
 
     def _get_agnostic_mask(self, person_pil: Image.Image, garment_pil: Image.Image,
-                            garment_size: str = "M", debug_dir: Path | None = None):
+                            garment_size: str = "M", category: str = "upper_body",
+                            debug_dir: Path | None = None):
         """Parse person → agnostic image + binary mask using SCHP + get_mask_location.
 
         person_pil is expected to already be letterboxed to SIZE_W:SIZE_H
         (same 3:4 aspect as PARSE_W:PARSE_H), so the resize below is a
         uniform downscale, not a distortion.
+
+        category: "upper_body" | "lower_body" | "dresses" — passed straight
+        into IDM-VTON's own get_mask_location(), which already supports all
+        three (this was previously hardcoded to "upper_body" for every job
+        regardless of what was actually being tried on).
         """
         parse_result, _ = self._parser(person_pil.resize((PARSE_W, PARSE_H)))
         keypoints = self._openpose(person_pil.resize((PARSE_W, PARSE_H)))
@@ -549,7 +555,7 @@ class GPUInferenceEngine:
         if debug_dir is not None:
             _save_debug_image(parse_result, debug_dir / "02_parsing_mask.png", "human parsing mask")
 
-        mask, mask_gray = self._get_mask_location("hd", "upper_body", parse_result, keypoints)
+        mask, mask_gray = self._get_mask_location("hd", category, parse_result, keypoints)
         # NEAREST: `mask` is a binary/label image — smooth resampling would
         # blur 0/255 edges into intermediate gray values.
         mask = mask.resize((SIZE_W, SIZE_H), Image.NEAREST)
@@ -614,20 +620,25 @@ class GPUInferenceEngine:
 
         # For half-sleeve garments, remove arm regions from mask so arms stay visible.
         # For full-sleeve garments, keep mask intact so sleeves cover the arms correctly.
-        sleeve_type = self._detect_sleeve_type(garment_pil)
-        if sleeve_type == "half":
-            mask_np = np.array(mask)
-            candidate = keypoints.get("pose_keypoints_2d", [])
-            sx2, sy2 = SIZE_W / 384.0, SIZE_H / 512.0
-            # Elbow + wrist joints only (not shoulder) — keeps shoulder area masked
-            arm_joints = [3, 4, 6, 7]
-            for idx in arm_joints:
-                if idx < len(candidate):
-                    cx = int(candidate[idx][0] * sx2)
-                    cy = int(candidate[idx][1] * sy2)
-                    if cx > 0 or cy > 0:
-                        cv2.circle(mask_np, (cx, cy), 30, 0, -1)
-            mask = Image.fromarray(mask_np)
+        # Sleeve detection is meaningless for lower_body garments (pants/skirts
+        # have no sleeves to detect) — skip this correction entirely for them,
+        # it would otherwise run sleeve detection against a garment photo of
+        # e.g. jeans and act on whatever it spuriously guessed.
+        if category != "lower_body":
+            sleeve_type = self._detect_sleeve_type(garment_pil)
+            if sleeve_type == "half":
+                mask_np = np.array(mask)
+                candidate = keypoints.get("pose_keypoints_2d", [])
+                sx2, sy2 = SIZE_W / 384.0, SIZE_H / 512.0
+                # Elbow + wrist joints only (not shoulder) — keeps shoulder area masked
+                arm_joints = [3, 4, 6, 7]
+                for idx in arm_joints:
+                    if idx < len(candidate):
+                        cx = int(candidate[idx][0] * sx2)
+                        cy = int(candidate[idx][1] * sy2)
+                        if cx > 0 or cy > 0:
+                            cv2.circle(mask_np, (cx, cy), 30, 0, -1)
+                mask = Image.fromarray(mask_np)
 
         import torchvision.transforms as T
         tensor_tf = T.Compose([
@@ -662,18 +673,26 @@ class GPUInferenceEngine:
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def run(self, person_path: str, garment_paths, output_path: str,
-            job_id: str = "", garment_size: str = "M") -> str:
+            job_id: str = "", garment_size: str = "M", category: str = "upper_body") -> str:
         """garment_paths: path to a single garment photo, or a list of paths —
         multiple angles/zoom levels of the SAME garment. The clearest one
         drives the spatial garment-warping channel (see
         _pick_best_garment_image); ALL of them contribute to the appearance/
         texture conditioning via averaged CLIP embeddings (see
-        _build_ip_adapter_embeds)."""
+        _build_ip_adapter_embeds).
+
+        category: "upper_body" | "lower_body" | "dresses" — which body
+        region this garment belongs to. Threaded into get_mask_location()
+        (via _get_agnostic_mask) and into the garment reference-width
+        scaling below (Step 1b), which previously always measured against
+        shoulder width regardless of what was being tried on — meaningless
+        for e.g. pants, where hip width is the correct reference."""
         import torchvision.transforms as T
 
         if not job_id:
             job_id = Path(output_path).stem
         garment_size = (garment_size or "M").strip().upper()
+        category = (category or "upper_body").strip().lower()
         if isinstance(garment_paths, str):
             garment_paths = [garment_paths]
 
@@ -713,45 +732,68 @@ class GPUInferenceEngine:
 
         # ── Step 1: Human parse + agnostic mask ──
         agnostic_pil, mask_pil, keypoints, parse_result = self._get_agnostic_mask(
-            person_pil, garment_pil, garment_size=garment_size, debug_dir=debug_dir,
+            person_pil, garment_pil, garment_size=garment_size, category=category, debug_dir=debug_dir,
         )
         person_size = self.last_person_size_estimate
         logger.info("Detected person size: %s | requested garment size: %s",
                     person_size, garment_size)
 
-        # ── Step 1b: Scale garment to person shoulder width + requested fit ──
+        # ── Step 1b: Scale garment to a body-region-appropriate reference
+        # measurement + requested fit. Shoulder width is the correct anchor
+        # for upper_body/dresses (both drape from the shoulders), but
+        # meaningless for lower_body — pants/skirts sit at the hips, so hip
+        # width (keypoints 8, 11 — same joints _estimate_person_size already
+        # reads) is used instead there. NOTE: the lower_body ref-ratio below
+        # (0.42) is a first-pass estimate, not empirically tuned the way the
+        # upper_body 0.55 value was (see FIT_STEP_DELTA revert history above)
+        # — expect to calibrate this once real pants/jeans jobs run.
         candidate = keypoints.get("pose_keypoints_2d", [])
         sx = SIZE_W / PARSE_W
-        if len(candidate) > 5:
-            r_shoulder = candidate[2]
-            l_shoulder = candidate[5]
-            if (r_shoulder[0] > 0 or r_shoulder[1] > 0) and (l_shoulder[0] > 0 or l_shoulder[1] > 0):
-                person_shoulder_w = abs(l_shoulder[0] - r_shoulder[0]) * sx
-                # Reference: assume garment occupies ~55% of SIZE_W at standard fit
-                ref_shoulder_w = SIZE_W * 0.55
-                scale = person_shoulder_w / ref_shoulder_w
-                # Blend in the requested garment size vs. detected person size —
-                # an L garment on an M person should render bigger/looser than
-                # an M garment on the same person, and vice versa.
-                scale *= self._fit_scale_factor(person_size, garment_size)
-                # REVERTED (see FIT_STEP_DELTA comment above) — paired with
-                # the FIT_FACTOR_MIN/MAX revert, back to the known-good clamp.
-                scale = max(0.65, min(scale, 1.45))
-                new_w = int(SIZE_W * scale)
-                new_h = int(SIZE_H * scale)
-                garment_scaled = garment_pil.resize((new_w, new_h), Image.LANCZOS)
-                # Paste on white canvas of SIZE_W x SIZE_H (center it)
-                canvas = Image.new("RGB", (SIZE_W, SIZE_H), (255, 255, 255))
-                paste_x = (SIZE_W - new_w) // 2
-                paste_y = (SIZE_H - new_h) // 2
-                canvas.paste(garment_scaled, (paste_x, paste_y))
-                garment_pil = canvas
-                logger.info(
-                    "Garment scaled by %.2f (shoulder_w=%.0fpx, fit=%s->%s) — "
-                    "final garment conditioning size=%dx%d pasted on %dx%d canvas",
-                    scale, person_shoulder_w, person_size, garment_size,
-                    new_w, new_h, SIZE_W, SIZE_H,
-                )
+
+        def _pt(i):
+            if i >= len(candidate):
+                return None
+            x, y = candidate[i][0], candidate[i][1]
+            return (x, y) if (x > 0 or y > 0) else None
+
+        if category == "lower_body":
+            r_hip, l_hip = _pt(8), _pt(11)
+            reference_pts = (r_hip, l_hip)
+            ref_ratio = 0.42
+            ref_label = "hip_w"
+        else:
+            r_sh, l_sh = _pt(2), _pt(5)
+            reference_pts = (r_sh, l_sh)
+            ref_ratio = 0.55
+            ref_label = "shoulder_w"
+
+        if all(reference_pts):
+            person_ref_w = abs(reference_pts[1][0] - reference_pts[0][0]) * sx
+            # Reference: assume garment occupies ~ref_ratio of SIZE_W at standard fit
+            ref_w = SIZE_W * ref_ratio
+            scale = person_ref_w / ref_w
+            # Blend in the requested garment size vs. detected person size —
+            # an L garment on an M person should render bigger/looser than
+            # an M garment on the same person, and vice versa.
+            scale *= self._fit_scale_factor(person_size, garment_size)
+            # REVERTED (see FIT_STEP_DELTA comment above) — paired with
+            # the FIT_FACTOR_MIN/MAX revert, back to the known-good clamp.
+            scale = max(0.65, min(scale, 1.45))
+            new_w = int(SIZE_W * scale)
+            new_h = int(SIZE_H * scale)
+            garment_scaled = garment_pil.resize((new_w, new_h), Image.LANCZOS)
+            # Paste on white canvas of SIZE_W x SIZE_H (center it)
+            canvas = Image.new("RGB", (SIZE_W, SIZE_H), (255, 255, 255))
+            paste_x = (SIZE_W - new_w) // 2
+            paste_y = (SIZE_H - new_h) // 2
+            canvas.paste(garment_scaled, (paste_x, paste_y))
+            garment_pil = canvas
+            logger.info(
+                "Garment scaled by %.2f (%s=%.0fpx, category=%s, fit=%s->%s) — "
+                "final garment conditioning size=%dx%d pasted on %dx%d canvas",
+                scale, ref_label, person_ref_w, category, person_size, garment_size,
+                new_w, new_h, SIZE_W, SIZE_H,
+            )
 
         # ── Step 2: Prepare tensors ──
         pose_img       = self._render_pose_image(keypoints, SIZE_W, SIZE_H)

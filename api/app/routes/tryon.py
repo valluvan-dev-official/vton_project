@@ -65,6 +65,24 @@ def _validate_garment_size(garment_size: str) -> str:
     return garment_size
 
 
+ALLOWED_CATEGORIES = {"upper_body", "lower_body", "dresses"}
+
+
+def _validate_category(category: Optional[str]) -> str:
+    """
+    Which body region get_mask_location() should target. Defaults to
+    upper_body — the same value every job was hardcoded to before this
+    param existed — so callers that don't send it yet see no behavior change.
+    """
+    category = (category or "upper_body").strip().lower()
+    if category not in ALLOWED_CATEGORIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"category: must be one of {sorted(ALLOWED_CATEGORIES)}."
+        )
+    return category
+
+
 # Sanity bounds only — not a measurement-accuracy claim. Used solely as an
 # optional scale reference for Phase-1 shadow-mode fit analysis (see
 # app/services/fit_analysis); never affects try-on rendering.
@@ -195,6 +213,12 @@ async def submit_tryon(
                           "The clearest one is auto-selected for inference."
     ),
     garment_size: str = Form("M", description="Garment size label: XS/S/M/L/XL/XXL"),
+    category: Optional[str] = Form(
+        None, description="Optional — upper_body/lower_body/dresses. Tells the "
+                           "model which body region this garment belongs to "
+                           "(top, bottom, or a full one-piece). Defaults to "
+                           "upper_body if omitted."
+    ),
     height_cm: Optional[float] = Form(
         None, description="Optional — used only as a scale reference for the "
                            "Phase-1 shadow-mode fit_analysis metadata; never "
@@ -211,6 +235,7 @@ async def submit_tryon(
     db: AsyncSession = Depends(get_db),
 ):
     garment_size = _validate_garment_size(garment_size)
+    category = _validate_category(category)
     height_cm = _validate_height_cm(height_cm)
     merchant, garment_sku = _validate_merchant_sku(merchant, garment_sku)
     job_id = str(uuid.uuid4())
@@ -223,11 +248,12 @@ async def submit_tryon(
         garment_image_path=garment_refs[0],
         garment_image_paths=json.dumps(garment_refs),
         garment_size=garment_size,
+        category=category,
     )
     db.add(job)
     await db.commit()
 
-    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku)
+    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku, category)
 
     return {
         "job_id": job_id,
@@ -249,6 +275,9 @@ async def submit_tryon_sync(
         ..., description=f"1-{MAX_GARMENT_IMAGES} photos of the SAME garment from different angles."
     ),
     garment_size: str = Form("M", description="Garment size label: XS/S/M/L/XL/XXL"),
+    category: Optional[str] = Form(
+        None, description="Optional — upper_body/lower_body/dresses. Defaults to upper_body."
+    ),
     height_cm: Optional[float] = Form(
         None, description="Optional — used only as a scale reference for the "
                            "Phase-1 shadow-mode fit_analysis metadata; never "
@@ -273,6 +302,7 @@ async def submit_tryon_sync(
     long-lived connection, or if you're firing many jobs concurrently.
     """
     garment_size = _validate_garment_size(garment_size)
+    category = _validate_category(category)
     height_cm = _validate_height_cm(height_cm)
     merchant, garment_sku = _validate_merchant_sku(merchant, garment_sku)
     job_id = str(uuid.uuid4())
@@ -285,11 +315,12 @@ async def submit_tryon_sync(
         garment_image_path=garment_refs[0],
         garment_image_paths=json.dumps(garment_refs),
         garment_size=garment_size,
+        category=category,
     )
     db.add(job)
     await db.commit()
 
-    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku)
+    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku, category)
 
     # Poll a fresh session each time so we see committed updates from the worker.
     elapsed = 0
