@@ -9,9 +9,12 @@ so this runs on CPU in the same worker process, no GPU job needed.
 
 Phase 1: WristOverlayEngine (MediaPipe Hands).
 Phase 2: GlassesOverlayEngine (MediaPipe Face Mesh) — same shape as Phase 1.
-Both registered in ACCESSORY_ENGINES below; the route/task layer dispatches
-generically by accessory_type, so adding either required zero changes to
-api/app/routes/accessory.py or the process_accessory_job Celery task.
+Phase 3: HandbagOverlayEngine (MediaPipe Hands) — same affine-warp approach
+as glasses (a bag's silhouette isn't radially symmetric like a wristband,
+so the rigid rotate+scale used for wrist accessories doesn't fit).
+All registered in ACCESSORY_ENGINES below; the route/task layer dispatches
+generically by accessory_type, so adding any of them required zero changes
+to api/app/routes/accessory.py or the process_accessory_job Celery task.
 """
 import logging
 
@@ -375,10 +378,194 @@ def get_glasses_engine() -> GlassesOverlayEngine:
     return _glasses_engine
 
 
+class HandbagOverlayEngine:
+    """
+    Handbag placement via MediaPipe Hands landmarks — "held/hanging from the
+    hand" rather than worn flush against the skin (contrast WristOverlayEngine).
+
+    Uses the same full-affine-warp technique as GlassesOverlayEngine (3-point
+    correspondence -> cv2.getAffineTransform), not the rigid rotate+scale used
+    for wristbands: a bag's silhouette isn't radially symmetric around a single
+    axis the way a watch band is, so it needs independent x/y scale and shear
+    to sit naturally at an angle relative to the hand.
+
+    MVP scope: composites the bag BEHIND the hand/arm (i.e. the hand is drawn
+    on top of it implicitly, since we paste onto the original photo which
+    already has the hand on top) at a point just past the knuckles, matching
+    the very common "bag handle looped over/held at the fingers, bag hanging
+    below" carry pose. It does NOT attempt finger-over-handle occlusion
+    compositing (fingers wrapping in front of the handle loop itself) — that
+    would need a hand segmentation mask, not just landmarks, and is a
+    deliberately deferred v2 refinement, not a blocker for realistic-looking
+    results in the common hanging-bag pose.
+    """
+
+    # MediaPipe Hands landmark indices (same model WristOverlayEngine uses).
+    WRIST = 0
+    INDEX_MCP = 5
+    PINKY_MCP = 17
+
+    # Same rationale as WristOverlayEngine.MIN_HAND_CONFIDENCE — MediaPipe's
+    # own 0.5 default lets partial/occluded hand fragments through.
+    MIN_HAND_CONFIDENCE = 0.75
+    MIN_WRIST_WIDTH_FRACTION = 0.03
+
+    # How far past the knuckle line the handle/grip point sits, as a
+    # fraction of the knuckle span — a bag handle looped over the fingers
+    # rests slightly beyond the knuckles (away from the wrist), not exactly
+    # on them. First-pass estimate, not empirically tuned.
+    GRIP_OFFSET_FRACTION = 0.35
+
+    def __init__(self, min_detection_confidence: float = MIN_HAND_CONFIDENCE):
+        self._min_confidence = min_detection_confidence
+        self._hands = None  # lazy-init — loading the model isn't free
+
+    def _get_hands(self):
+        if self._hands is None:
+            import mediapipe as mp
+            self._hands = mp.solutions.hands.Hands(
+                static_image_mode=True,
+                max_num_hands=1,
+                min_detection_confidence=self._min_confidence,
+            )
+        return self._hands
+
+    def detect_hand_points(self, person_bgr: np.ndarray):
+        """
+        Returns (index_mcp_xy, pinky_mcp_xy, grip_xy) in person-image pixel
+        coordinates, or None if no hand found / the detection doesn't look
+        like a genuinely visible hand (same gates as WristOverlayEngine).
+        index_mcp/pinky_mcp bracket the "width" the handle sits across;
+        grip_xy is just past the knuckle line (away from the wrist) — where
+        a looped handle naturally rests.
+        """
+        h, w = person_bgr.shape[:2]
+        rgb = cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB)
+        result = self._get_hands().process(rgb)
+        if not result.multi_hand_landmarks:
+            return None
+
+        if result.multi_handedness:
+            score = result.multi_handedness[0].classification[0].score
+            if score < self.MIN_HAND_CONFIDENCE:
+                logger.info("Handbag detection rejected: handedness score %.2f below threshold %.2f",
+                            score, self.MIN_HAND_CONFIDENCE)
+                return None
+
+        lm = result.multi_hand_landmarks[0].landmark
+
+        def pt(i):
+            return np.array([lm[i].x * w, lm[i].y * h])
+
+        wrist = pt(self.WRIST)
+        index_mcp = pt(self.INDEX_MCP)
+        pinky_mcp = pt(self.PINKY_MCP)
+
+        knuckle_span = float(np.linalg.norm(index_mcp - pinky_mcp))
+        if knuckle_span < w * self.MIN_WRIST_WIDTH_FRACTION:
+            logger.info("Handbag detection rejected: knuckle span %.0fpx too narrow for a %dpx-wide photo "
+                        "(likely a partial/occluded hand)", knuckle_span, w)
+            return None
+
+        knuckle_mid = (index_mcp + pinky_mcp) / 2
+        # Away-from-wrist direction, i.e. the direction the fingers point —
+        # the handle sits just beyond the knuckles in this direction.
+        away_from_wrist = knuckle_mid - wrist
+        norm = np.linalg.norm(away_from_wrist)
+        away_from_wrist = away_from_wrist / norm if norm > 1e-6 else np.array([0.0, -1.0])
+        grip = knuckle_mid + away_from_wrist * knuckle_span * self.GRIP_OFFSET_FRACTION
+
+        return index_mcp, pinky_mcp, grip
+
+    def validate(self, person_path: str) -> tuple[bool, str | None]:
+        """Fast pre-flight check — no compositing, just "can we find a hand here."""
+        person_bgr = cv2.imread(person_path)
+        if person_bgr is None:
+            return False, "This photo couldn't be read — please choose a different one."
+        if self.detect_hand_points(person_bgr) is None:
+            return False, ("No hand clearly visible in this photo — try a photo with your hand "
+                            "fully visible, not tucked away or out of frame.")
+        return True, None
+
+    def run(self, person_path: str, accessory_path: str, output_path: str) -> None:
+        """
+        person_path: the profile photo.
+        accessory_path: the product's front try-on image — already
+            background-removed (transparent PNG), same pipeline as the other
+            accessory/garment images. Expected framing: handle/strap at the
+            top of the cutout, bag body below — the same convention product
+            photography already uses for bags shot for e-commerce.
+        Raises LandmarkNotDetectedError if no hand is found (caller — the
+        Celery task — catches this and fails the job with that message).
+        """
+        person_bgr = cv2.imread(person_path)
+        if person_bgr is None:
+            raise ValueError(f"Could not read person image: {person_path}")
+
+        points = self.detect_hand_points(person_bgr)
+        if points is None:
+            raise LandmarkNotDetectedError(
+                "No hand clearly visible in this photo — try a photo with your hand fully "
+                "visible, not tucked away or out of frame."
+            )
+        index_mcp, pinky_mcp, grip = points
+
+        accessory = Image.open(accessory_path).convert("RGBA")
+        accessory_np = np.array(accessory)  # H x W x 4 (RGBA)
+
+        # Reuses the same silhouette-derived anchor technique as glasses:
+        # left/right = centroid of each half of the cutout's non-transparent
+        # content, top = topmost non-transparent pixel in the central band
+        # (for a bag cutout framed handle-up, this is the handle/strap).
+        accessory_left, accessory_right, accessory_top = GlassesOverlayEngine._derive_accessory_anchor_points(
+            accessory_np
+        )
+        src_pts = np.float32([accessory_left, accessory_right, accessory_top])
+        dst_pts = np.float32([index_mcp, pinky_mcp, grip])
+
+        M = cv2.getAffineTransform(src_pts, dst_pts)
+
+        person_h, person_w = person_bgr.shape[:2]
+        warped = cv2.warpAffine(
+            accessory_np, M, (person_w, person_h),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0),
+        )
+
+        # Same gamma-boost as glasses — thin straps/handles are mostly
+        # anti-aliased edge pixels that fade too far toward transparent
+        # after the affine interpolation otherwise.
+        alpha = warped[:, :, 3].astype(np.float32) / 255.0
+        alpha = np.power(alpha, 0.45)
+        warped[:, :, 3] = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+
+        person_rgba = Image.open(person_path).convert("RGBA")
+        warped_pil = Image.fromarray(warped, mode="RGBA")
+        person_rgba.alpha_composite(warped_pil)
+
+        person_rgba.convert("RGB").save(output_path, "JPEG", quality=95)
+        logger.info(
+            "Handbag overlay: affine-warped accessory anchors=%s/%s/%s -> hand points=%s/%s, grip=%s -> %s",
+            accessory_left, accessory_right, accessory_top,
+            index_mcp, pinky_mcp, grip, output_path,
+        )
+
+
+_handbag_engine: HandbagOverlayEngine | None = None
+
+
+def get_handbag_engine() -> HandbagOverlayEngine:
+    global _handbag_engine
+    if _handbag_engine is None:
+        _handbag_engine = HandbagOverlayEngine()
+    return _handbag_engine
+
+
 # Registry keyed by accessory_type, the same string the API/task layer uses —
 # adding a new accessory engine is "implement it above + add a line here,"
 # not touching the route/task dispatch code (both already iterate this dict).
 ACCESSORY_ENGINES = {
     "wrist": get_wrist_engine,
     "glasses": get_glasses_engine,
+    "handbag": get_handbag_engine,
 }

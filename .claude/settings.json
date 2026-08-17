@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(docker-compose up *)"
+      "Bash(docker-compose up *)",
+      "Bash(python manage.py makemigrations products)",
+      "Bash(python manage.py shell -c ' *)",
+      "Bash(python -c ' *)"
     ]
   }
 }
