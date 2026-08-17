@@ -722,7 +722,7 @@ class GPUInferenceEngine:
         # automatically — no separate letterbox call is needed for them. The
         # padding is undone on the final result before saving (Step 5).
         person_pil, letterbox_transform = _letterbox_image(person_pil_raw, SIZE_W, SIZE_H)
-        garment_pil, _ = _letterbox_image(garment_orig, SIZE_W, SIZE_H)
+        garment_pil, garment_letterbox_t = _letterbox_image(garment_orig, SIZE_W, SIZE_H)
 
         if debug_dir is not None:
             _save_debug_image(person_pil, debug_dir / "01b_person_letterboxed.jpg",
@@ -743,10 +743,32 @@ class GPUInferenceEngine:
         # for upper_body/dresses (both drape from the shoulders), but
         # meaningless for lower_body — pants/skirts sit at the hips, so hip
         # width (keypoints 8, 11 — same joints _estimate_person_size already
-        # reads) is used instead there. NOTE: the lower_body ref-ratio below
-        # (0.42) is a first-pass estimate, not empirically tuned the way the
-        # upper_body 0.55 value was (see FIT_STEP_DELTA revert history above)
-        # — expect to calibrate this once real pants/jeans jobs run.
+        # reads) is used instead there.
+        #
+        # BUG FIX (regression investigation, 2026-08-17 prod logs): the old
+        # formula computed `ref_w = SIZE_W * ref_ratio`, i.e. it assumed the
+        # garment's photographed content ALWAYS fills exactly `ref_ratio`
+        # (0.55) of the full canvas width — completely ignoring how the
+        # actual submitted photo was framed. Real merchant garment photos
+        # are framed edge-to-edge (confirmed from prod logs: both an
+        # 800x790 and a 1024x1366 garment photo letterboxed to fill 100% of
+        # the 768px canvas width, not 55%). Combined with typical full-body
+        # person photos where shoulders only span ~30-40% of frame width
+        # (there's headroom/legroom, unlike the garment photo), this made
+        # every job shrink the garment to ~0.65-0.70x regardless of size
+        # match — e.g. an S person requesting an M (one size UP) garment
+        # was getting SHRUNK below their own body width instead of
+        # rendering looser, the opposite of correct behavior.
+        #
+        # Fixed by measuring the garment's ACTUAL on-canvas content width
+        # (`garment_letterbox_t.new_w`, from the real letterbox geometry of
+        # THIS photo) instead of assuming it equals SIZE_W, and recalibrating
+        # ref_ratio against that real content width using the observed prod
+        # values (shoulder_w=272px on a 768px canvas -> person's shoulders
+        # are the anchor for what "standard/matched fit" should look like,
+        # so ref_ratio is now the fraction of the garment's own content
+        # width the reference body measurement should equal at a MATCHED
+        # size pairing, not a fraction of the full canvas).
         candidate = keypoints.get("pose_keypoints_2d", [])
         sx = SIZE_W / PARSE_W
 
@@ -759,18 +781,23 @@ class GPUInferenceEngine:
         if category == "lower_body":
             r_hip, l_hip = _pt(8), _pt(11)
             reference_pts = (r_hip, l_hip)
-            ref_ratio = 0.42
+            # NOTE: still a first-pass estimate (proportionally rescaled
+            # from the corrected upper_body value below) — not empirically
+            # tuned against real pants/jeans jobs yet.
+            ref_ratio = 0.27
             ref_label = "hip_w"
         else:
             r_sh, l_sh = _pt(2), _pt(5)
             reference_pts = (r_sh, l_sh)
-            ref_ratio = 0.55
+            ref_ratio = 0.35
             ref_label = "shoulder_w"
 
         if all(reference_pts):
             person_ref_w = abs(reference_pts[1][0] - reference_pts[0][0]) * sx
-            # Reference: assume garment occupies ~ref_ratio of SIZE_W at standard fit
-            ref_w = SIZE_W * ref_ratio
+            # Reference: the garment's OWN measured content width (not the
+            # full canvas) scaled by ref_ratio — see bug-fix note above.
+            content_w = max(garment_letterbox_t.new_w, 1)
+            ref_w = content_w * ref_ratio
             scale = person_ref_w / ref_w
             # Blend in the requested garment size vs. detected person size —
             # an L garment on an M person should render bigger/looser than
