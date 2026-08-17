@@ -587,10 +587,27 @@ class GPUInferenceEngine:
         # adds only that specific leftover band; it never touches background,
         # arm, or neck-skin pixels, and is a separate, independent correction
         # from the arm/torso-gap fix above.
-        collar_corrected_np, collar_candidate_np, collar_protection_np, collar_diag = correct_collar_mask(
-            parse_np_full, np.array(mask), scaled_keypoints
-        )
-        mask = Image.fromarray(collar_corrected_np)
+        #
+        # BUG FIX (2026-08-18, pants gray-blob incident): this correction is
+        # collar/neckline-specific — meaningless for lower_body (pants have no
+        # collar), and was previously called unconditionally for every
+        # category. For a lower_body job it still added ~28K px of "leftover
+        # upper-garment" mask around the chest/neck (purely from shoulder
+        # keypoints, independent of what's actually being tried on), which the
+        # diffusion model then had to paint with no coherent guidance — the
+        # spatial `cloth` channel for a pants job carries no chest-region
+        # content at all — producing a disconnected gray blob over the torso.
+        # Gated to upper_body/dresses only, matching what this correction is
+        # actually for.
+        if category in ("upper_body", "dresses"):
+            collar_corrected_np, collar_candidate_np, collar_protection_np, collar_diag = correct_collar_mask(
+                parse_np_full, np.array(mask), scaled_keypoints
+            )
+            mask = Image.fromarray(collar_corrected_np)
+        else:
+            collar_candidate_np = collar_protection_np = np.zeros_like(np.array(mask))
+            collar_diag = {"side": "collar", "skipped": True, "added_px": 0, "reason": "category_not_upper_body_or_dress"}
+            logger.info("[collar_mask_correction] skipped=True added_px=0 reason=category_not_upper_body_or_dress")
 
         if debug_dir is not None:
             _save_debug_image(collar_candidate_np, debug_dir / "04c_detected_collar_region.png",
