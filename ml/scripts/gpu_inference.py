@@ -855,10 +855,18 @@ class GPUInferenceEngine:
 
         # Pass either the pre-computed multi-image averaged embedding, or
         # fall back to the single best garment image — whichever is available.
+        # IMPORTANT: use garment_orig (the clean, un-letterboxed, un-scaled
+        # source photo), NOT garment_pil — by this point garment_pil has been
+        # through Step 1b's fit-scaling (resized to 65-145% and pasted onto a
+        # white canvas with padding for the spatial `cloth` channel). Feeding
+        # that padded/shrunk image to CLIP for appearance conditioning diluted
+        # the garment's texture/pattern/color signal with white border on
+        # every job, degrading fit and appearance quality. CLIP's own feature
+        # extractor handles resizing, so the raw original needs no letterbox.
         ip_adapter_kwargs = (
             {"ip_adapter_image_embeds": ip_adapter_embeds}
             if ip_adapter_embeds is not None
-            else {"ip_adapter_image": garment_pil}
+            else {"ip_adapter_image": garment_orig}
         )
 
         with torch.inference_mode():
