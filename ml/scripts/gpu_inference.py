@@ -797,18 +797,42 @@ class GPUInferenceEngine:
             # Reference: the garment's OWN measured content width (not the
             # full canvas) scaled by ref_ratio — see bug-fix note above.
             content_w = max(garment_letterbox_t.new_w, 1)
+            content_h = max(garment_letterbox_t.new_h, 1)
             ref_w = content_w * ref_ratio
             scale = person_ref_w / ref_w
             # Blend in the requested garment size vs. detected person size —
             # an L garment on an M person should render bigger/looser than
             # an M garment on the same person, and vice versa.
             scale *= self._fit_scale_factor(person_size, garment_size)
-            # REVERTED (see FIT_STEP_DELTA comment above) — paired with
-            # the FIT_FACTOR_MIN/MAX revert, back to the known-good clamp.
-            scale = max(0.65, min(scale, 1.45))
-            new_w = int(SIZE_W * scale)
-            new_h = int(SIZE_H * scale)
-            garment_scaled = garment_pil.resize((new_w, new_h), Image.LANCZOS)
+            scale = max(0.5, min(scale, 2.0))
+
+            # BUG FIX (2026-08-18, "bell bottom jeans" black-blob incident):
+            # this used to resize the WHOLE letterboxed canvas (content +
+            # padding) by `scale`, e.g. 768x1024 * 1.45 = 1114x1485, then
+            # paste-center it onto a fresh 768x1024 canvas. Any scale > 1
+            # produced an oversized image that got silently center-cropped
+            # on paste — a hard zoom into the middle of the garment photo,
+            # not a resize of the garment. For a full-bleed photo (content
+            # fills the whole canvas) this crop mostly went unnoticed; for a
+            # narrow/tall photo like a pants shot on a wide canvas (content
+            # only ~440px of a 768px-wide canvas), it zoomed into a random
+            # patch of fabric and rendered as a shapeless blob instead of
+            # pants.
+            #
+            # Fixed by scaling only the CONTENT crop (from the real letterbox
+            # geometry, not the padded canvas) and clamping the scale so the
+            # resized content can never exceed the canvas — no crop, ever.
+            max_w_scale = SIZE_W * 0.95 / content_w
+            max_h_scale = SIZE_H * 0.95 / content_h
+            scale = min(scale, max_w_scale, max_h_scale)
+
+            content_crop = garment_pil.crop((
+                garment_letterbox_t.pad_x, garment_letterbox_t.pad_y,
+                garment_letterbox_t.pad_x + content_w, garment_letterbox_t.pad_y + content_h,
+            ))
+            new_w = max(1, int(content_w * scale))
+            new_h = max(1, int(content_h * scale))
+            garment_scaled = content_crop.resize((new_w, new_h), Image.LANCZOS)
             # Paste on white canvas of SIZE_W x SIZE_H (center it)
             canvas = Image.new("RGB", (SIZE_W, SIZE_H), (255, 255, 255))
             paste_x = (SIZE_W - new_w) // 2
