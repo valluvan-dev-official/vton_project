@@ -641,10 +641,10 @@ class GPUInferenceEngine:
         # have no sleeves to detect) — skip this correction entirely for them,
         # it would otherwise run sleeve detection against a garment photo of
         # e.g. jeans and act on whatever it spuriously guessed.
+        candidate = keypoints.get("pose_keypoints_2d", [])
+        sx2, sy2 = SIZE_W / 384.0, SIZE_H / 512.0
         if category != "lower_body":
             sleeve_type = self._detect_sleeve_type(garment_pil)
-            candidate = keypoints.get("pose_keypoints_2d", [])
-            sx2, sy2 = SIZE_W / 384.0, SIZE_H / 512.0
             if sleeve_type == "half":
                 mask_np = np.array(mask)
                 # Elbow + wrist joints only (not shoulder) — keeps shoulder area masked
@@ -680,12 +680,44 @@ class GPUInferenceEngine:
                             if x > 0 or y > 0:
                                 pts.append((int(x * sx2), int(y * sy2)))
                     for p1, p2 in zip(pts, pts[1:]):
-                        cv2.line(mask_np, p1, p2, 255, thickness=55)
+                        # Narrowed from 55px (2026-08-21): at 55px this line
+                        # was wide enough to bleed past the actual arm width
+                        # into background pixels next to a bent elbow,
+                        # marking real background as "editable" and letting
+                        # the diffusion model paint fabric/noise into it —
+                        # showing up as background not being preserved.
+                        # 34px hugs a typical forearm width at this
+                        # resolution without the overreach.
+                        cv2.line(mask_np, p1, p2, 255, thickness=34)
                 mask = Image.fromarray(mask_np)
 
                 if debug_dir is not None:
                     _save_debug_image(mask, debug_dir / "04f_full_sleeve_forearm_mask.png",
                                        "mask after forced forearm/wrist coverage for full-sleeve garment")
+
+        # ── Final safety clamp: never let ANY of the corrections above touch
+        # the face/hair ──
+        # get_mask_location()'s own SCHP-based face/hair exclusion is the
+        # only thing keeping the face out of the mask — none of the manual
+        # corrections above (arm-gap, collar, fit-scale dilation, forearm
+        # coverage) explicitly re-check that, so a correction that dilates
+        # or bridges near the neck/jaw/hairline can leak into face pixels,
+        # which the inpaint loop then partially regenerates — reported as
+        # the output "not looking like the same person". Zero out a keypoint-
+        # anchored ellipse around the head unconditionally as a last step,
+        # regardless of what any correction above did.
+        nose = None
+        if candidate and len(candidate) > 0:
+            nx, ny = candidate[0][0], candidate[0][1]
+            if nx > 0 or ny > 0:
+                nose = (int(nx * sx2), int(ny * sy2))
+        if nose is not None:
+            mask_np = np.array(mask)
+            head_h = max(int(SIZE_H * 0.14), 40)
+            head_w = max(int(SIZE_W * 0.11), 30)
+            cv2.ellipse(mask_np, (nose[0], nose[1] - head_h // 3),
+                        (head_w, head_h), 0, 0, 360, 0, -1)
+            mask = Image.fromarray(mask_np)
 
         import torchvision.transforms as T
         tensor_tf = T.Compose([
