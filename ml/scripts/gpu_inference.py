@@ -643,10 +643,10 @@ class GPUInferenceEngine:
         # e.g. jeans and act on whatever it spuriously guessed.
         if category != "lower_body":
             sleeve_type = self._detect_sleeve_type(garment_pil)
+            candidate = keypoints.get("pose_keypoints_2d", [])
+            sx2, sy2 = SIZE_W / 384.0, SIZE_H / 512.0
             if sleeve_type == "half":
                 mask_np = np.array(mask)
-                candidate = keypoints.get("pose_keypoints_2d", [])
-                sx2, sy2 = SIZE_W / 384.0, SIZE_H / 512.0
                 # Elbow + wrist joints only (not shoulder) — keeps shoulder area masked
                 arm_joints = [3, 4, 6, 7]
                 for idx in arm_joints:
@@ -656,6 +656,36 @@ class GPUInferenceEngine:
                         if cx > 0 or cy > 0:
                             cv2.circle(mask_np, (cx, cy), 30, 0, -1)
                 mask = Image.fromarray(mask_np)
+            else:
+                # BUG FIX (2026-08-21, sleeve white-patch incident): sleeve
+                # detection only looks at the target GARMENT photo, never at
+                # the person's own original sleeve state. When the person's
+                # photo has short/rolled-up sleeves but the requested garment
+                # is full-sleeve, SCHP's human parser labels the exposed
+                # forearm as skin (not garment), so get_mask_location()'s base
+                # mask under-covers that region. The inpaint loop then blends
+                # the ORIGINAL bare-forearm pixels back in every step there,
+                # producing a pale/washed-out patch instead of new sleeve
+                # fabric. Explicitly union in a thick shoulder->elbow->wrist
+                # band per arm so the full forearm is always in the
+                # inpainting mask for full-sleeve garments, regardless of
+                # what the base parse labeled it as.
+                mask_np = np.array(mask)
+                arm_chains = [(2, 3, 4), (5, 6, 7)]  # (shoulder, elbow, wrist) L/R
+                for a, b, c in arm_chains:
+                    pts = []
+                    for idx in (a, b, c):
+                        if idx < len(candidate):
+                            x, y = candidate[idx][0], candidate[idx][1]
+                            if x > 0 or y > 0:
+                                pts.append((int(x * sx2), int(y * sy2)))
+                    for p1, p2 in zip(pts, pts[1:]):
+                        cv2.line(mask_np, p1, p2, 255, thickness=55)
+                mask = Image.fromarray(mask_np)
+
+                if debug_dir is not None:
+                    _save_debug_image(mask, debug_dir / "04f_full_sleeve_forearm_mask.png",
+                                       "mask after forced forearm/wrist coverage for full-sleeve garment")
 
         import torchvision.transforms as T
         tensor_tf = T.Compose([
@@ -943,7 +973,12 @@ class GPUInferenceEngine:
                 negative_prompt_embeds=negative_prompt_embeds.to(self.device, torch.float16),
                 pooled_prompt_embeds=pooled_prompt_embeds.to(self.device, torch.float16),
                 negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(self.device, torch.float16),
-                num_inference_steps=30,
+                # Raised from 30 (2026-08-21): 30 is the floor of IDM-VTON's
+                # typical 30-50 range and under-resolved fine fabric weave/
+                # specular detail, contributing to a flat/plastic texture.
+                # 45 costs proportionally more latency (~1.5x) but is still
+                # well under a full 50-step run.
+                num_inference_steps=45,
                 generator=generator,
                 strength=1.0,
                 pose_img=pose_tensor,
