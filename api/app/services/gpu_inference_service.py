@@ -180,7 +180,8 @@ def get_gpu_engine():
 
 
 def run(person_path: str, garment_paths, output_path: str,
-        job_id: str = "", garment_size: str = "M", category: str = "upper_body") -> str:
+        job_id: str = "", garment_size: str = "M", category: str = "upper_body",
+        dress_subtype: str | None = None) -> str:
     """Convenience module-level function — mirror of GPUInferenceEngine.run().
 
     garment_paths may be a single path (str) or a list of paths — multiple
@@ -191,6 +192,10 @@ def run(person_path: str, garment_paths, output_path: str,
     GPUInferenceEngine.run() / get_mask_location(). Defaults to "upper_body",
     the literal every job was hardcoded to before this param existed.
 
+    dress_subtype: "saree" | "salwar_suit" | None — only meaningful when
+    category == "dresses"; selects which dedicated sleeve-detection module
+    GPUInferenceEngine.run() uses (see its docstring). Ignored otherwise.
+
     Ensures the output directory exists before delegating to the singleton
     engine so callers do not need to create it themselves.  Returns the
     auto-detected person body-size bucket (e.g. "M") used for fit scaling.
@@ -199,5 +204,6 @@ def run(person_path: str, garment_paths, output_path: str,
         garment_paths = [garment_paths]
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     engine = get_gpu_engine()
-    engine.run(person_path, garment_paths, output_path, job_id=job_id, garment_size=garment_size, category=category)
+    engine.run(person_path, garment_paths, output_path, job_id=job_id, garment_size=garment_size,
+               category=category, dress_subtype=dress_subtype)
     return engine.last_person_size_estimate

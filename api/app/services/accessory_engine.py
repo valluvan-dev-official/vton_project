@@ -1,28 +1,56 @@
 """
-Lightweight CPU compositing engines for accessory try-on (watches/bracelets,
-glasses) — landmark detection + a 2D perspective warp of an already
-background-removed product cutout onto the person photo. Deliberately NOT
-the same technique as garment try-on (see ml/scripts/gpu_inference.py,
-IDM-VTON diffusion) — placing a rigid object like a watch or glasses is a
-much simpler problem than generatively re-rendering fabric drape on a body,
-so this runs on CPU in the same worker process, no GPU job needed.
+Accessory try-on engines. Most of these (watches/bracelets, glasses) are
+lightweight CPU compositing — landmark detection + a 2D affine warp of an
+already background-removed product cutout onto the person photo. Placing a
+rigid object like a watch or glasses is a much simpler problem than
+generatively re-rendering fabric drape or hand-object contact, so those run
+on CPU in the same worker process, no GPU job needed.
 
 Phase 1: WristOverlayEngine (MediaPipe Hands).
 Phase 2: GlassesOverlayEngine (MediaPipe Face Mesh) — same shape as Phase 1.
-Phase 3: HandbagOverlayEngine (MediaPipe Hands) — same affine-warp approach
-as glasses (a bag's silhouette isn't radially symmetric like a wristband,
-so the rigid rotate+scale used for wrist accessories doesn't fit).
+Phase 3: HandbagOverlayEngine (MediaPipe Hands, CPU affine warp) — kept as a
+fallback (get_handbag_overlay_engine), but NOT the registered "handbag"
+engine: a pasted-behind-the-hand cutout can't show fingers actually
+gripping the handle, which is the whole point of a "held" bag. The
+registered "handbag" engine is HandbagGripEngineAdapter, which delegates to
+ml/scripts/handbag_grip_engine.HandbagGripEngine — an SDXL inpainting +
+IP-Adapter GPU pipeline that regenerates the grip region so the hand
+actually appears to hold the bag, the same generative-conditioning idea
+IDM-VTON itself uses for garments (see ml/scripts/gpu_inference.py).
+
 All registered in ACCESSORY_ENGINES below; the route/task layer dispatches
 generically by accessory_type, so adding any of them required zero changes
 to api/app/routes/accessory.py or the process_accessory_job Celery task.
 """
 import logging
+from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# Where ml/scripts lives relative to this file (api/app/services/accessory_engine.py
+# -> vton_project/ml/scripts). Same bind-mount layout inference.py relies on
+# for gpu_inference.py — see its _ML_ROOT_CANDIDATES.
+_ML_SCRIPTS_CANDIDATES = [
+    Path("/app/ml/scripts"),
+    Path(__file__).resolve().parents[3] / "ml" / "scripts",
+]
+
+
+def _ensure_ml_scripts_on_path() -> None:
+    import sys
+    for candidate in _ML_SCRIPTS_CANDIDATES:
+        if candidate.is_dir():
+            p = str(candidate)
+            if p not in sys.path:
+                sys.path.insert(0, p)
+            return
+    raise RuntimeError(
+        f"accessory_engine: could not locate ml/scripts (tried {_ML_SCRIPTS_CANDIDATES})."
+    )
 
 
 class LandmarkNotDetectedError(Exception):
@@ -554,16 +582,75 @@ class HandbagOverlayEngine:
 _handbag_engine: HandbagOverlayEngine | None = None
 
 
-def get_handbag_engine() -> HandbagOverlayEngine:
+def get_handbag_overlay_engine() -> HandbagOverlayEngine:
+    """CPU compositing fallback — kept available but not the default (see
+    HandbagGripEngineAdapter below); does not show fingers gripping the
+    handle, only a repositioned flat cutout."""
     global _handbag_engine
     if _handbag_engine is None:
         _handbag_engine = HandbagOverlayEngine()
     return _handbag_engine
 
 
+class HandbagGripEngineAdapter:
+    """
+    Thin adapter around ml/scripts/handbag_grip_engine.HandbagGripEngine (a
+    GPU SDXL-inpainting engine) so it satisfies the same validate()/run()
+    shape as every other entry in ACCESSORY_ENGINES, and so a
+    HandDetectionError from the ml-side module surfaces to the Celery task
+    as the same LandmarkNotDetectedError every other engine raises — tasks.py
+    only ever catches this one exception type.
+
+    Deliberately NOT importing torch/diffusers at module import time (this
+    file is imported by both the GPU worker and, transitively, anything else
+    that touches accessory_engine.py) — the ml_scripts import and the heavy
+    model load both happen lazily, on first .validate()/.run() call.
+    """
+
+    def __init__(self):
+        self._engine = None
+
+    def _get_engine(self):
+        if self._engine is None:
+            _ensure_ml_scripts_on_path()
+            from handbag_grip_engine import HandbagGripEngine
+            from app.config import get_settings
+            settings = get_settings()
+            self._engine = HandbagGripEngine(
+                weights_dir=(settings.WEIGHTS_DIR or None),
+                device=(settings.DEVICE or "cuda"),
+            )
+        return self._engine
+
+    def validate(self, person_path: str) -> tuple[bool, str | None]:
+        return self._get_engine().validate(person_path)
+
+    def run(self, person_path: str, accessory_path: str, output_path: str) -> None:
+        _ensure_ml_scripts_on_path()
+        from handbag_grip_engine import HandDetectionError
+        try:
+            self._get_engine().run(person_path, accessory_path, output_path)
+        except HandDetectionError as exc:
+            raise LandmarkNotDetectedError(str(exc)) from exc
+
+
+_handbag_grip_engine: HandbagGripEngineAdapter | None = None
+
+
+def get_handbag_engine() -> HandbagGripEngineAdapter:
+    global _handbag_grip_engine
+    if _handbag_grip_engine is None:
+        _handbag_grip_engine = HandbagGripEngineAdapter()
+    return _handbag_grip_engine
+
+
 # Registry keyed by accessory_type, the same string the API/task layer uses —
 # adding a new accessory engine is "implement it above + add a line here,"
 # not touching the route/task dispatch code (both already iterate this dict).
+# NOTE: "handbag" runs on GPU (HandbagGripEngineAdapter -> HandbagGripEngine,
+# SDXL inpainting) unlike wrist/glasses, which are CPU-only overlays — see
+# HandbagGripEngineAdapter's docstring for why a held bag needs generative
+# grip regeneration rather than a compositing overlay.
 ACCESSORY_ENGINES = {
     "wrist": get_wrist_engine,
     "glasses": get_glasses_engine,

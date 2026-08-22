@@ -28,6 +28,9 @@ from letterbox_geometry import LetterboxTransform, compute_letterbox_geometry
 from mask_gap_correction import correct_agnostic_mask_gap, scale_keypoints
 from collar_mask_correction import correct_collar_mask
 from garment_color_transfer import apply_garment_color_transfer
+from dress_sleeve_detection import detect_dress_sleeve_type
+from saree_handling import detect_saree_sleeve_type
+from salwar_suit_handling import detect_salwar_suit_sleeve_type
 
 logger = logging.getLogger(__name__)
 
@@ -535,6 +538,7 @@ class GPUInferenceEngine:
 
     def _get_agnostic_mask(self, person_pil: Image.Image, garment_pil: Image.Image,
                             garment_size: str = "M", category: str = "upper_body",
+                            dress_subtype: str | None = None,
                             debug_dir: Path | None = None):
         """Parse person → agnostic image + binary mask using SCHP + get_mask_location.
 
@@ -644,7 +648,27 @@ class GPUInferenceEngine:
         candidate = keypoints.get("pose_keypoints_2d", [])
         sx2, sy2 = SIZE_W / 384.0, SIZE_H / 512.0
         if category != "lower_body":
-            sleeve_type = self._detect_sleeve_type(garment_pil)
+            # Each garment kind under "dresses" gets its own dedicated
+            # detector module (saree/salwar_suit/gown), so tuning one
+            # subtype's heuristic never silently changes another's:
+            #   - saree_handling.py: sarees have no sleeve of their own to
+            #     detect (see module docstring) — always "full".
+            #   - salwar_suit_handling.py: kurta-top sleeves.
+            #   - dress_sleeve_detection.py: gowns/frocks (the default for
+            #     "dresses" when dress_subtype is missing/unrecognised, so
+            #     existing callers that don't send it yet see no behavior
+            #     change).
+            # Shirts (upper_body) keep using _detect_sleeve_type's original
+            # single-band logic, untouched.
+            if category == "dresses":
+                if dress_subtype == "saree":
+                    sleeve_type = detect_saree_sleeve_type(garment_pil)
+                elif dress_subtype == "salwar_suit":
+                    sleeve_type = detect_salwar_suit_sleeve_type(garment_pil)
+                else:
+                    sleeve_type = detect_dress_sleeve_type(garment_pil)
+            else:
+                sleeve_type = self._detect_sleeve_type(garment_pil)
             if sleeve_type == "half":
                 mask_np = np.array(mask)
                 # Elbow + wrist joints only (not shoulder) — keeps shoulder area masked
@@ -752,7 +776,8 @@ class GPUInferenceEngine:
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def run(self, person_path: str, garment_paths, output_path: str,
-            job_id: str = "", garment_size: str = "M", category: str = "upper_body") -> str:
+            job_id: str = "", garment_size: str = "M", category: str = "upper_body",
+            dress_subtype: str | None = None) -> str:
         """garment_paths: path to a single garment photo, or a list of paths —
         multiple angles/zoom levels of the SAME garment. The clearest one
         drives the spatial garment-warping channel (see
@@ -765,13 +790,20 @@ class GPUInferenceEngine:
         (via _get_agnostic_mask) and into the garment reference-width
         scaling below (Step 1b), which previously always measured against
         shoulder width regardless of what was being tried on — meaningless
-        for e.g. pants, where hip width is the correct reference."""
+        for e.g. pants, where hip width is the correct reference.
+
+        dress_subtype: "saree" | "salwar_suit" | None — only meaningful
+        when category == "dresses". Selects which of the three dedicated
+        sleeve-detection modules to use (saree_handling.py,
+        salwar_suit_handling.py, or dress_sleeve_detection.py's gown/frock
+        default when None/unrecognised). Ignored for upper_body/lower_body."""
         import torchvision.transforms as T
 
         if not job_id:
             job_id = Path(output_path).stem
         garment_size = (garment_size or "M").strip().upper()
         category = (category or "upper_body").strip().lower()
+        dress_subtype = (dress_subtype or "").strip().lower() or None
         if isinstance(garment_paths, str):
             garment_paths = [garment_paths]
 
@@ -811,7 +843,8 @@ class GPUInferenceEngine:
 
         # ── Step 1: Human parse + agnostic mask ──
         agnostic_pil, mask_pil, keypoints, parse_result = self._get_agnostic_mask(
-            person_pil, garment_pil, garment_size=garment_size, category=category, debug_dir=debug_dir,
+            person_pil, garment_pil, garment_size=garment_size, category=category,
+            dress_subtype=dress_subtype, debug_dir=debug_dir,
         )
         person_size = self.last_person_size_estimate
         logger.info("Detected person size: %s | requested garment size: %s",

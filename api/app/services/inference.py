@@ -117,7 +117,7 @@ class InferenceRouter:
 
     def run(self, person_image_path: str, garment_image_paths,
             output_path: str, job_id: str = "", garment_size: str = "M",
-            category: str = "upper_body") -> str:
+            category: str = "upper_body", dress_subtype: str | None = None) -> str:
         """garment_image_paths: a single path, or a list of paths (multiple
         angles of the same garment — only the local_gpu/IDM-VTON backend
         actually makes use of more than one; other backends use the first).
@@ -126,6 +126,11 @@ class InferenceRouter:
         local_gpu/IDM-VTON backend acts on this (threaded into
         get_mask_location()); other backends (own model, placeholder,
         SageMaker) ignore it, same as before this param existed.
+
+        dress_subtype: "saree" | "salwar_suit" | None — only meaningful
+        when category == "dresses"; only the local_gpu/IDM-VTON backend
+        acts on it (selects a dedicated sleeve-detection module — see
+        GPUInferenceEngine.run()'s docstring). Other backends ignore it.
 
         Returns output_path. The auto-detected person body-size bucket (when
         available) is left on self.last_person_size_estimate for the caller
@@ -137,6 +142,7 @@ class InferenceRouter:
             garment_image_paths = [garment_image_paths]
         garment_size = (garment_size or "M").strip().upper()
         category = (category or "upper_body").strip().lower()
+        dress_subtype = (dress_subtype or "").strip().lower() or None
         job_id = job_id or Path(output_path).stem
 
         clean_garment_paths = [self._preprocess_garment(p) for p in garment_image_paths]
@@ -160,6 +166,7 @@ class InferenceRouter:
                 self.last_person_size_estimate = _gpu_run(
                     person_image_path, clean_garment_paths, output_path,
                     job_id=job_id, garment_size=garment_size, category=category,
+                    dress_subtype=dress_subtype,
                 )
                 return output_path
             except Exception as exc:
