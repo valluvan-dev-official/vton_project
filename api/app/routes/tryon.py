@@ -83,6 +83,31 @@ def _validate_category(category: Optional[str]) -> str:
     return category
 
 
+ALLOWED_DRESS_SUBTYPES = {"saree", "salwar_suit"}
+
+
+def _validate_dress_subtype(dress_subtype: Optional[str], category: str) -> Optional[str]:
+    """
+    Only meaningful when category == "dresses" — selects a dedicated
+    sleeve-detection module (saree_handling.py / salwar_suit_handling.py)
+    instead of the generic gown/frock dress_sleeve_detection.py default.
+    Ignored (returned as None) for any other category, since e.g. a
+    "salwar_suit" value on an upper_body job has nothing to act on.
+    None/omitted preserves the pre-existing single "dresses" bucket
+    behavior — the generic gown/frock handler — so existing callers that
+    don't send it yet see no behavior change.
+    """
+    dress_subtype = (dress_subtype or "").strip().lower() or None
+    if dress_subtype is None or category != "dresses":
+        return None
+    if dress_subtype not in ALLOWED_DRESS_SUBTYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"dress_subtype: must be one of {sorted(ALLOWED_DRESS_SUBTYPES)} (or omitted)."
+        )
+    return dress_subtype
+
+
 # Sanity bounds only — not a measurement-accuracy claim. Used solely as an
 # optional scale reference for Phase-1 shadow-mode fit analysis (see
 # app/services/fit_analysis); never affects try-on rendering.
@@ -219,6 +244,12 @@ async def submit_tryon(
                            "(top, bottom, or a full one-piece). Defaults to "
                            "upper_body if omitted."
     ),
+    dress_subtype: Optional[str] = Form(
+        None, description="Optional, only meaningful when category=dresses — "
+                           "saree/salwar_suit. Selects a dedicated sleeve-"
+                           "detection module instead of the generic gown/frock "
+                           "default. Ignored for any other category."
+    ),
     height_cm: Optional[float] = Form(
         None, description="Optional — used only as a scale reference for the "
                            "Phase-1 shadow-mode fit_analysis metadata; never "
@@ -236,6 +267,7 @@ async def submit_tryon(
 ):
     garment_size = _validate_garment_size(garment_size)
     category = _validate_category(category)
+    dress_subtype = _validate_dress_subtype(dress_subtype, category)
     height_cm = _validate_height_cm(height_cm)
     merchant, garment_sku = _validate_merchant_sku(merchant, garment_sku)
     job_id = str(uuid.uuid4())
@@ -253,7 +285,7 @@ async def submit_tryon(
     db.add(job)
     await db.commit()
 
-    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku, category)
+    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku, category, dress_subtype)
 
     return {
         "job_id": job_id,
@@ -277,6 +309,12 @@ async def submit_tryon_sync(
     garment_size: str = Form("M", description="Garment size label: XS/S/M/L/XL/XXL"),
     category: Optional[str] = Form(
         None, description="Optional — upper_body/lower_body/dresses. Defaults to upper_body."
+    ),
+    dress_subtype: Optional[str] = Form(
+        None, description="Optional, only meaningful when category=dresses — "
+                           "saree/salwar_suit. Selects a dedicated sleeve-"
+                           "detection module instead of the generic gown/frock "
+                           "default. Ignored for any other category."
     ),
     height_cm: Optional[float] = Form(
         None, description="Optional — used only as a scale reference for the "
@@ -303,6 +341,7 @@ async def submit_tryon_sync(
     """
     garment_size = _validate_garment_size(garment_size)
     category = _validate_category(category)
+    dress_subtype = _validate_dress_subtype(dress_subtype, category)
     height_cm = _validate_height_cm(height_cm)
     merchant, garment_sku = _validate_merchant_sku(merchant, garment_sku)
     job_id = str(uuid.uuid4())
@@ -320,7 +359,7 @@ async def submit_tryon_sync(
     db.add(job)
     await db.commit()
 
-    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku, category)
+    process_tryon_job.delay(job_id, person_ref, garment_refs, garment_size, height_cm, merchant, garment_sku, category, dress_subtype)
 
     # Poll a fresh session each time so we see committed updates from the worker.
     elapsed = 0

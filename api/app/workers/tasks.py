@@ -343,7 +343,7 @@ def _resolve_local_path(s3_key_or_path: str, job_id: str, role: str) -> str:
 def process_tryon_job(self, job_id: str, person_image_path: str,
                        garment_image_paths, garment_size: str = "M",
                        height_cm=None, merchant=None, garment_sku=None,
-                       category: str = "upper_body"):
+                       category: str = "upper_body", dress_subtype: str = None):
     """
     Main try-on pipeline:
       1. Resolve input images (download from S3 if needed)
@@ -361,6 +361,12 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
     positional signature keep working unchanged. category defaults to
     "upper_body" for the same reason — that's the literal every job was
     hardcoded to before this param existed.
+
+    dress_subtype: "saree" | "salwar_suit" | None — only meaningful when
+    category == "dresses"; selects a dedicated sleeve-detection module in
+    the GPU inference engine (see GPUInferenceEngine.run()'s docstring).
+    Defaults to None (falls back to the generic gown/frock dress handler)
+    so existing callers that don't send it yet see no behavior change.
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -399,7 +405,7 @@ def process_tryon_job(self, job_id: str, person_image_path: str,
         router = get_inference_router()
         router.run(
             local_person, local_garments, output_path, job_id=job_id,
-            garment_size=garment_size, category=category,
+            garment_size=garment_size, category=category, dress_subtype=dress_subtype,
         )
         person_size_estimate = router.last_person_size_estimate
         logger.info(
