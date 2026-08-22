@@ -703,7 +703,24 @@ class GPUInferenceEngine:
                             x, y = candidate[idx][0], candidate[idx][1]
                             if x > 0 or y > 0:
                                 pts.append((int(x * sx2), int(y * sy2)))
-                    for p1, p2 in zip(pts, pts[1:]):
+                    for i, (p1, p2) in enumerate(zip(pts, pts[1:])):
+                        # BUG FIX (2026-08-22, blurry/distorted hands
+                        # incident): the elbow->wrist segment used to run
+                        # all the way to the raw wrist keypoint. OpenPose
+                        # wrist estimates are frequently a few px off, so at
+                        # 34px thickness the line's rounded end could bleed
+                        # past the actual wrist into hand/finger pixels,
+                        # marking them "editable" — the inpaint loop then
+                        # partially regenerated the hand, showing up as
+                        # blurry/malformed fingers. Pull the elbow->wrist
+                        # segment's endpoint back to 80% of the way there so
+                        # the mask always stops short of the hand, whatever
+                        # the wrist keypoint's exact pixel error is.
+                        is_forearm_segment = (i == len(pts) - 2)
+                        if is_forearm_segment:
+                            ex, ey = p1
+                            wx, wy = p2
+                            p2 = (int(ex + (wx - ex) * 0.80), int(ey + (wy - ey) * 0.80))
                         # Narrowed from 55px (2026-08-21): at 55px this line
                         # was wide enough to bleed past the actual arm width
                         # into background pixels next to a bent elbow,
@@ -742,6 +759,34 @@ class GPUInferenceEngine:
             cv2.ellipse(mask_np, (nose[0], nose[1] - head_h // 3),
                         (head_w, head_h), 0, 0, 360, 0, -1)
             mask = Image.fromarray(mask_np)
+
+        # ── Final safety clamp: never let ANY correction above touch the
+        # hands ──
+        # BUG FIX (2026-08-22, blurry/distorted hands incident): same
+        # rationale as the face clamp above — the forearm-coverage
+        # correction's elbow->wrist segment already pulls its endpoint back
+        # from the raw wrist keypoint, but any OTHER correction (fit-scale
+        # dilation, arm-gap bridging) could still push the mask boundary
+        # past the wrist into hand/finger pixels regardless. Zero out a
+        # small keypoint-anchored circle just past each wrist, unconditionally,
+        # as a last step — same "protect this landmark no matter what
+        # upstream logic decided" pattern as the face clamp.
+        for elbow_idx, wrist_idx in ((3, 4), (6, 7)):  # (elbow, wrist) right, left
+            if wrist_idx < len(candidate) and elbow_idx < len(candidate):
+                ex, ey = candidate[elbow_idx][0], candidate[elbow_idx][1]
+                wx, wy = candidate[wrist_idx][0], candidate[wrist_idx][1]
+                if (wx > 0 or wy > 0) and (ex > 0 or ey > 0):
+                    # Centered a bit PAST the wrist (extrapolated along the
+                    # elbow->wrist direction), not ON it — a circle centered
+                    # exactly at the wrist joint would clip into the actual
+                    # sleeve-cuff/forearm mask right at the wrist boundary,
+                    # reintroducing the earlier white-cuff-patch bug.
+                    hx = wx + (wx - ex) * 0.35
+                    hy = wy + (wy - ey) * 0.35
+                    mask_np = np.array(mask)
+                    hand_r = max(int(SIZE_W * 0.045), 18)
+                    cv2.circle(mask_np, (int(hx * sx2), int(hy * sy2)), hand_r, 0, -1)
+                    mask = Image.fromarray(mask_np)
 
         import torchvision.transforms as T
         tensor_tf = T.Compose([
@@ -1053,14 +1098,28 @@ class GPUInferenceEngine:
                 image=person_pil,
                 height=SIZE_H,
                 width=SIZE_W,
-                # Raised from 2.5: at that low a CFG scale the model's learned
-                # "normal fit" prior tended to dominate over the mask-shape/
-                # garment-scale conditioning that's supposed to carry the
-                # size signal. 3.5 is still well below typical SDXL defaults
-                # (5-9) to avoid over-driving general image quality — this is
-                # the one change here most worth re-checking visually on the
-                # GPU box, since it affects overall output, not just sizing.
-                guidance_scale=3.5,
+                # Raised from 2.5 to 3.5 previously: at that low a CFG scale
+                # the model's learned "normal fit" prior tended to dominate
+                # over the mask-shape/garment-scale conditioning carrying the
+                # size signal.
+                #
+                # EXPERIMENTAL (2026-08-22, neckline/drape mismatch
+                # complaint): raised further to 4.5 — there is no separate
+                # IP-Adapter conditioning-strength knob in this pipeline
+                # (checked ml/src/models/pipeline.py), so guidance_scale is
+                # the only lever controlling how strongly the model follows
+                # the ACTUAL garment reference photo's neckline/drape shape
+                # vs. its own generic learned "dress" prior. A too-low CFG
+                # plausibly explains outputs whose neckline/drape don't match
+                # the source garment. Still below typical SDXL defaults
+                # (5-9). THIS IS THE SAME PARAMETER responsible for the
+                # previously-reverted sizing regression when pushed too far
+                # in the other direction — if a re-test shows fit/sizing
+                # accuracy regressing (garment looking generically "normal
+                # fit" regardless of requested size again), revert to 3.5 and
+                # look for a different lever instead of pushing this one
+                # further.
+                guidance_scale=4.5,
                 **ip_adapter_kwargs,
             )[0]
 
