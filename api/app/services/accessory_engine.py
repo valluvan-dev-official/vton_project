@@ -601,14 +601,26 @@ class HandbagGripEngineAdapter:
     as the same LandmarkNotDetectedError every other engine raises — tasks.py
     only ever catches this one exception type.
 
-    Deliberately NOT importing torch/diffusers at module import time (this
-    file is imported by both the GPU worker and, transitively, anything else
-    that touches accessory_engine.py) — the ml_scripts import and the heavy
-    model load both happen lazily, on first .validate()/.run() call.
+    IMPORTANT: validate() deliberately does NOT touch ml/scripts or import
+    torch/diffusers. POST /accessory-tryon/validate runs synchronously
+    inside the API process (see routes/accessory.py), which is a
+    deliberately lightweight image decoupled from the GPU worker's — per
+    docker-compose.gpu.yml, ml/ is bind-mounted into the WORKER container
+    only, not the API one. Reaching for ml/scripts here previously produced
+    an uncaught RuntimeError -> HTTP 500 on every validate call for
+    "handbag" (torch/diffusers absent, ml/scripts unreachable, from the API
+    container). validate() instead reuses HandbagOverlayEngine's
+    self-contained MediaPipe-only hand detection (already shipped in the API
+    image, since wrist/glasses depend on it too) — same landmark logic, just
+    without the GPU pipeline behind it. Only .run() — which always executes
+    inside the Celery task, and thus always inside the GPU worker container
+    — imports the ml_scripts module and loads the heavy model, lazily, on
+    first call.
     """
 
     def __init__(self):
         self._engine = None
+        self._cpu_hand_detector = None  # HandbagOverlayEngine, MediaPipe-only, for validate()
 
     def _get_engine(self):
         if self._engine is None:
@@ -623,7 +635,9 @@ class HandbagGripEngineAdapter:
         return self._engine
 
     def validate(self, person_path: str) -> tuple[bool, str | None]:
-        return self._get_engine().validate(person_path)
+        if self._cpu_hand_detector is None:
+            self._cpu_hand_detector = HandbagOverlayEngine()
+        return self._cpu_hand_detector.validate(person_path)
 
     def run(self, person_path: str, accessory_path: str, output_path: str) -> None:
         _ensure_ml_scripts_on_path()
