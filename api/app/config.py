@@ -39,6 +39,18 @@ class Settings(BaseSettings):
     WEIGHTS_DIR: str = "/app/ml/weights"        # viton512.ckpt + warp_viton.pth live here
     WORKSPACE:   str = "/tmp/vton_workspace"    # temp dir for repo clones / artefacts
 
+    # ── Handbag grip inpainting (HandbagGripEngine) ──────────────────────────
+    # Deliberately separate from DEVICE above. IDM-VTON (DEVICE=cuda) already
+    # occupies ~21GB of the 22-24GB GPU worker at all times (loaded eagerly at
+    # worker startup, see worker_startup.py) — there isn't room left for a
+    # second SDXL-class pipeline alongside it, and evicting/reloading one to
+    # make room for the other (tried first) means every alternating
+    # garment/handbag job pays a multi-minute reload penalty, which is worse
+    # under real concurrent traffic than just running handbag jobs on CPU.
+    # Set to "cuda" only once handbag jobs run on a separate GPU/worker from
+    # the garment pipeline (see HandbagGripEngine's docstring).
+    HANDBAG_DEVICE: str = "cpu"
+
     # ── Model bootstrap ──────────────────────────────────────────────────────
     # S3 key of the model archive downloaded when WEIGHTS_DIR is empty.
     # Set to "" to disable automatic download (weights must be present already).

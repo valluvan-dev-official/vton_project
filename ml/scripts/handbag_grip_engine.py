@@ -1,5 +1,5 @@
 """
-Handbag "held in hand" GPU inference engine — SDXL inpainting + IP-Adapter.
+Handbag "held in hand" inference engine — SDXL inpainting + IP-Adapter.
 
 Why this exists (contrast with api/app/services/accessory_engine.py's
 HandbagOverlayEngine): the CPU overlay engine composites a flat product
@@ -7,7 +7,20 @@ cutout behind the hand — it can never show fingers wrapping in front of a
 handle/strap, because it never touches the hand pixels themselves. Getting
 that requires regenerating the grip region, which is a generative inpainting
 problem (same category as garment try-on), not a compositing one — so this
-engine lives here, next to gpu_inference.py, and runs as a GPU job.
+engine lives here, next to gpu_inference.py.
+
+Runs on CPU by default (see HANDBAG_DEVICE in api/app/config.py), NOT the
+GPU garment worker's cuda device, despite being architecturally the same
+"SDXL diffusion job" category as IDM-VTON. Reason: IDM-VTON is loaded
+eagerly at worker startup and occupies ~21GB of the 22-24GB GPU worker at
+all times — there is no room left for a second SDXL-class pipeline
+alongside it. An evict-the-other-pipeline-first arbiter was tried
+(gpu_pipeline_arbiter.py, still present and used when device == "cuda")
+but under real traffic that alternates garment/handbag jobs, it means every
+switch pays a multi-minute reload penalty — worse than just running this
+on CPU, which trades per-job speed for zero VRAM contention and no
+reload thrashing. Set HANDBAG_DEVICE=cuda only once handbag jobs run on a
+separate GPU/worker from the garment pipeline.
 
 Pipeline:
   1. MediaPipe Hands -> wrist/knuckle landmarks -> grip point + inpaint mask
@@ -106,8 +119,10 @@ class HandbagGripEngine:
         """Frees this engine's VRAM. Registered with the GPU pipeline
         arbiter (see gpu_pipeline_arbiter.py) so a garment job can evict
         this pipeline and reclaim the GPU — the two don't fit together on
-        one 22-24GB card. Reloading afterwards costs the same ~1-2 minutes
-        the initial load did (_get_pipe() below)."""
+        one 22-24GB card. Only relevant if this engine is actually running
+        on cuda (see _get_pipe()'s arbiter guard below) — on CPU this is
+        never registered/called, since there's no VRAM contention to
+        arbitrate in the first place."""
         if self._pipe is not None:
             logger.info("HandbagGripEngine: unloading SDXL pipeline to free VRAM...")
             self._pipe = None
@@ -117,10 +132,20 @@ class HandbagGripEngine:
             torch.cuda.empty_cache()
 
     def _get_pipe(self):
-        from gpu_pipeline_arbiter import get_arbiter
-        arbiter = get_arbiter()
-        arbiter.register("handbag", self._unload_pipe)
-        arbiter.acquire("handbag")
+        # The GPU arbiter only matters when this pipeline actually competes
+        # for GPU VRAM. Default deployment runs this on CPU (see
+        # HANDBAG_DEVICE in api/app/config.py) specifically so it NEVER
+        # contends with IDM-VTON for the worker's single GPU — evicting one
+        # SDXL pipeline to load the other meant every alternating
+        # garment/handbag job paid a multi-minute reload penalty under real
+        # traffic, which is worse than just running handbag on CPU. Only
+        # touch the arbiter when device == "cuda" (e.g. a future dedicated
+        # GPU/worker for handbag jobs where VRAM sharing is a real concern).
+        if self._device == "cuda":
+            from gpu_pipeline_arbiter import get_arbiter
+            arbiter = get_arbiter()
+            arbiter.register("handbag", self._unload_pipe)
+            arbiter.acquire("handbag")
 
         if self._pipe is None:
             import torch
