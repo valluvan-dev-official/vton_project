@@ -630,7 +630,11 @@ class HandbagGripEngineAdapter:
             settings = get_settings()
             self._engine = HandbagGripEngine(
                 weights_dir=(settings.WEIGHTS_DIR or None),
-                device=(settings.DEVICE or "cuda"),
+                # Deliberately settings.HANDBAG_DEVICE, NOT settings.DEVICE —
+                # see HANDBAG_DEVICE's comment in config.py: this pipeline
+                # runs on CPU by default so it never contends with IDM-VTON
+                # for the GPU worker's VRAM.
+                device=(settings.HANDBAG_DEVICE or "cpu"),
             )
         return self._engine
 
