@@ -161,13 +161,39 @@ def _build_engine():
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _unload_engine() -> None:
+    """Free the resident GPUInferenceEngine's VRAM. Registered with the GPU
+    pipeline arbiter (see gpu_pipeline_arbiter.py) so a handbag job can
+    evict this ~21GB pipeline before loading its own — the two never fit
+    on one 22-24GB GPU at the same time. Reloading afterwards costs the
+    same ~4 minutes the initial boot did (_build_engine() below)."""
+    global _engine
+    if _engine is not None:
+        logger.info("gpu_inference_service: unloading GPU engine to free VRAM...")
+        _engine = None
+        import gc
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 def get_gpu_engine():
     """Return the process-level GPUInferenceEngine singleton.
 
     Thread-safe lazy initialisation: the engine is created on the first call
     and reused on every subsequent call.  Raises RuntimeError (never silently
     falls back) if the GPU, weights, or S3 access is misconfigured.
+
+    Acquires the shared GPU pipeline arbiter first — if a handbag job most
+    recently evicted this engine to free VRAM, _engine is None here and
+    gets rebuilt (same cost as the very first boot).
     """
+    _add_ml_to_path()
+    from gpu_pipeline_arbiter import get_arbiter  # noqa: PLC0415
+    arbiter = get_arbiter()
+    arbiter.register("garment", _unload_engine)
+    arbiter.acquire("garment")
+
     global _engine
     if _engine is not None:
         return _engine

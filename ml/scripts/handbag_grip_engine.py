@@ -102,7 +102,26 @@ class HandbagGripEngine:
             )
         return self._hands
 
+    def _unload_pipe(self) -> None:
+        """Frees this engine's VRAM. Registered with the GPU pipeline
+        arbiter (see gpu_pipeline_arbiter.py) so a garment job can evict
+        this pipeline and reclaim the GPU — the two don't fit together on
+        one 22-24GB card. Reloading afterwards costs the same ~1-2 minutes
+        the initial load did (_get_pipe() below)."""
+        if self._pipe is not None:
+            logger.info("HandbagGripEngine: unloading SDXL pipeline to free VRAM...")
+            self._pipe = None
+            import gc
+            import torch
+            gc.collect()
+            torch.cuda.empty_cache()
+
     def _get_pipe(self):
+        from gpu_pipeline_arbiter import get_arbiter
+        arbiter = get_arbiter()
+        arbiter.register("handbag", self._unload_pipe)
+        arbiter.acquire("handbag")
+
         if self._pipe is None:
             import torch
             from diffusers import AutoPipelineForInpainting
