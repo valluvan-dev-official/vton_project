@@ -662,6 +662,315 @@ def get_handbag_engine() -> HandbagGripEngineAdapter:
     return _handbag_grip_engine
 
 
+# ===========================================================================
+# Phase 1 additions — earring / ring / hat / necklace
+#
+# Same shape as WristOverlayEngine / GlassesOverlayEngine: MediaPipe landmark
+# detection + a warp of the product's own background-removed cutout. The
+# repeated warp/anchor/composite maths lives in _overlay_common; only the
+# per-accessory landmark→anchor mapping is here. All first-pass geometry
+# (offsets, scale ratios) — expect to tune against real photos once shipped.
+# ===========================================================================
+from app.services import _overlay_common as _oc  # noqa: E402
+
+# MediaPipe Face Mesh is ~30 MB; earring/hat/necklace all need it, so share
+# one lazily-created instance instead of one per engine.
+_shared_face_mesh = None
+
+
+def _get_shared_face_mesh():
+    global _shared_face_mesh
+    if _shared_face_mesh is None:
+        import mediapipe as mp
+        _shared_face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True, max_num_faces=1,
+            refine_landmarks=False, min_detection_confidence=0.5,
+        )
+    return _shared_face_mesh
+
+
+def _face_landmarks(person_bgr: np.ndarray):
+    """dict of the landmark indices the Phase 1 face engines need, in pixel
+    coords, or None if no face. Keys: r_eye,l_eye,nose,forehead,chin,
+    r_ear,l_ear,r_jaw,l_jaw plus derived face_w,face_h."""
+    h, w = person_bgr.shape[:2]
+    res = _get_shared_face_mesh().process(cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB))
+    if not res.multi_face_landmarks:
+        return None
+    lm = res.multi_face_landmarks[0].landmark
+
+    def p(i):
+        return np.array([lm[i].x * w, lm[i].y * h], np.float64)
+
+    pts = {
+        "r_eye": p(33), "l_eye": p(263), "nose": p(168),
+        "forehead": p(10), "chin": p(152),
+        "r_ear": p(234), "l_ear": p(454),
+        "r_jaw": p(172), "l_jaw": p(397),
+    }
+    pts["face_w"] = float(np.hypot(*(pts["l_ear"] - pts["r_ear"])))
+    pts["face_h"] = float(np.hypot(*(pts["chin"] - pts["forehead"])))
+    return pts
+
+
+def _hand_landmarks(person_bgr: np.ndarray, min_conf: float = 0.6):
+    """dict with ring-finger + hand-width landmarks (pixel coords) or None."""
+    import mediapipe as mp
+    h, w = person_bgr.shape[:2]
+    with mp.solutions.hands.Hands(
+        static_image_mode=True, max_num_hands=1, min_detection_confidence=min_conf,
+    ) as hands:
+        res = hands.process(cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB))
+    if not res.multi_hand_landmarks:
+        return None
+    if res.multi_handedness and res.multi_handedness[0].classification[0].score < min_conf:
+        return None
+    lm = res.multi_hand_landmarks[0].landmark
+
+    def p(i):
+        return np.array([lm[i].x * w, lm[i].y * h], np.float64)
+
+    idx_mcp, pinky_mcp = p(5), p(17)
+    hand_w = float(np.hypot(*(idx_mcp - pinky_mcp)))
+    if hand_w < w * 0.03:
+        return None  # partial / occluded hand — same gate as WristOverlayEngine
+    return {"ring_mcp": p(13), "ring_pip": p(14), "ring_dip": p(15),
+            "hand_w": hand_w}
+
+
+class _FaceOverlayBase:
+    """Shared validate() for the face-anchored Phase 1 engines."""
+
+    _NO_FACE_MSG = "No face detected in this photo — try a clearer, front-facing photo."
+
+    def validate(self, person_path: str) -> tuple[bool, str | None]:
+        bgr = cv2.imread(person_path)
+        if bgr is None:
+            return False, "This photo couldn't be read — please choose a different one."
+        if _face_landmarks(bgr) is None:
+            return False, self._NO_FACE_MSG
+        return True, None
+
+    def _read(self, person_path: str):
+        bgr = cv2.imread(person_path)
+        if bgr is None:
+            raise ValueError(f"Could not read person image: {person_path}")
+        f = _face_landmarks(bgr)
+        if f is None:
+            raise LandmarkNotDetectedError(self._NO_FACE_MSG)
+        return bgr, f
+
+
+class EarringOverlayEngine(_FaceOverlayBase):
+    """Earrings hanging from each earlobe (MediaPipe Face Mesh tragion + drop).
+
+    The product cutout is one earring; it's placed on whichever ear(s) are
+    plausibly forward-facing and mirrored horizontally for the far ear. The
+    cutout's TOP anchor is pinned to the lobe so the piece hangs downward
+    from it, tilted with head roll.
+    """
+
+    LOBE_DROP_FRAC = 0.16     # lobe sits this * face_h below the tragion
+    EARRING_H_FRAC = 0.14     # target earring height as a fraction of face_h
+    # An ear whose tragion is within this * face_w of the face centre line
+    # is too far around the side of the head to place an earring believably.
+    SIDE_VISIBLE_FRAC = 0.62
+
+    def run(self, person_path: str, accessory_path: str, output_path: str) -> None:
+        bgr, f = self._read(person_path)
+        ph, pw = bgr.shape[:2]
+        roll = _oc.roll_deg(f["r_eye"], f["l_eye"])
+        centre_x = (f["r_ear"][0] + f["l_ear"][0]) / 2
+        min_gap = f["face_w"] * self.SIDE_VISIBLE_FRAC / 2
+
+        acc = np.array(Image.open(accessory_path).convert("RGBA"))
+        x0, y0, x1, y1 = _oc.silhouette_bbox(acc)
+        acc_h = max(y1 - y0, 1)
+        target_h = f["face_h"] * self.EARRING_H_FRAC
+        scale = target_h / acc_h
+
+        composed = Image.open(person_path).convert("RGBA")
+        placed = 0
+        for ear, mirror in ((f["r_ear"], False), (f["l_ear"], True)):
+            if abs(ear[0] - centre_x) < min_gap:
+                continue
+            lobe = (ear[0], ear[1] + f["face_h"] * self.LOBE_DROP_FRAC)
+            piece = acc[:, ::-1] if mirror else acc
+            lx0, ly0, lx1, ly1 = _oc.silhouette_bbox(piece)
+            top_anchor = ((lx0 + lx1) / 2, ly0)
+
+            new_w = max(1, int(piece.shape[1] * scale))
+            new_h = max(1, int(piece.shape[0] * scale))
+            small = cv2.resize(piece, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+            top_s = (top_anchor[0] * scale, top_anchor[1] * scale)
+            bot_s = (top_anchor[0] * scale, top_anchor[1] * scale + target_h)
+            dst_top = lobe
+            dst_bot = _oc.rotate_about((lobe[0], lobe[1] + target_h), lobe, roll)
+            warped = _oc.similarity_from_2pt(top_s, bot_s, dst_top, dst_bot,
+                                            small, pw, ph)
+            warped = _oc.boost_alpha(warped)
+            composed.alpha_composite(Image.fromarray(warped, "RGBA"))
+            placed += 1
+
+        if placed == 0:
+            raise LandmarkNotDetectedError(
+                "No ear clearly visible in this photo — try a straight-on, "
+                "front-facing photo with your ears not covered by hair."
+            )
+        composed.convert("RGB").save(output_path, "JPEG", quality=95)
+        logger.info("Earring overlay: placed on %d ear(s), roll=%.1f -> %s",
+                    placed, roll, output_path)
+
+
+class HatOverlayEngine(_FaceOverlayBase):
+    """Hat/cap sitting on the crown (Face Mesh forehead-top + ear-to-ear width)."""
+
+    BRIM_LIFT_FRAC = 0.12    # brim line sits this * face_h above the forehead point
+    WIDTH_OVERSCAN = 1.18    # hat is a bit wider than the bare head
+
+    def run(self, person_path: str, accessory_path: str, output_path: str) -> None:
+        bgr, f = self._read(person_path)
+        ph, pw = bgr.shape[:2]
+
+        up = (f["forehead"] - f["chin"])
+        up = up / (np.hypot(*up) or 1.0)          # unit vector "up the face"
+        right = f["l_ear"] - f["r_ear"]
+        right = right / (np.hypot(*right) or 1.0)
+
+        brim_c = f["forehead"] + up * (f["face_h"] * self.BRIM_LIFT_FRAC)
+        half = f["face_w"] * self.WIDTH_OVERSCAN / 2
+        brim_l = brim_c - right * half
+        brim_r = brim_c + right * half
+        crown = brim_c + up * (f["face_h"] * 0.05)   # top anchor just above brim
+
+        acc = np.array(Image.open(accessory_path).convert("RGBA"))
+        a_l, a_r, a_t = _oc.silhouette_anchors(acc)
+        warped = _oc.affine_from_3pt(
+            np.array([a_l, a_r, a_t]), np.array([brim_l, brim_r, crown]),
+            acc, pw, ph,
+        )
+        warped = _oc.boost_alpha(warped)
+        _oc.composite(person_path, warped, output_path, shadow=True,
+                      shadow_offset=(0, 4), shadow_opacity=0.22)
+        logger.info("Hat overlay: brim %.0f..%.0f -> %s", brim_l[0], brim_r[0], output_path)
+
+
+class NecklaceOverlayEngine(_FaceOverlayBase):
+    """Necklace draped below the chin (Face Mesh chin + jaw-corner width)."""
+
+    DRAPE_DROP_FRAC = 0.55   # necklace centre sits this * face_h below the chin
+    WIDTH_FRAC = 1.7         # necklace span relative to jaw-corner width
+
+    _NO_FACE_MSG = ("No face/neck detected in this photo — try a front-facing "
+                    "photo showing your neck and upper chest.")
+
+    def run(self, person_path: str, accessory_path: str, output_path: str) -> None:
+        bgr, f = self._read(person_path)
+        ph, pw = bgr.shape[:2]
+
+        down = (f["chin"] - f["forehead"])
+        down = down / (np.hypot(*down) or 1.0)
+        right = f["l_jaw"] - f["r_jaw"]
+        right_len = np.hypot(*right) or 1.0
+        right = right / right_len
+
+        drape_c = f["chin"] + down * (f["face_h"] * self.DRAPE_DROP_FRAC)
+        half = right_len * self.WIDTH_FRAC / 2
+        drape_l = drape_c - right * half
+        drape_r = drape_c + right * half
+        # top anchor: where the chain meets the sides of the neck, ~level with
+        # the jaw corners, so the cutout's neckline curve starts there.
+        top_c = (f["r_jaw"] + f["l_jaw"]) / 2 + down * (f["face_h"] * 0.10)
+
+        acc = np.array(Image.open(accessory_path).convert("RGBA"))
+        a_l, a_r, a_t = _oc.silhouette_anchors(acc)
+        warped = _oc.affine_from_3pt(
+            np.array([a_l, a_r, a_t]), np.array([drape_l, drape_r, top_c]),
+            acc, pw, ph,
+        )
+        warped = _oc.boost_alpha(warped)
+        _oc.composite(person_path, warped, output_path, shadow=True,
+                      shadow_offset=(0, 5), shadow_opacity=0.25)
+        logger.info("Necklace overlay: drape %.0f..%.0f -> %s",
+                    drape_l[0], drape_r[0], output_path)
+
+
+class RingOverlayEngine:
+    """Ring on the ring-finger proximal phalanx (MediaPipe Hands 13->14)."""
+
+    BAND_POS_FRAC = 0.38     # ring centre this fraction from MCP toward PIP
+    BAND_WIDTH_FRAC = 0.55   # ring band width as a fraction of the MCP->PIP length
+
+    _NO_HAND_MSG = ("No hand clearly visible in this photo — try a photo with "
+                    "your fingers spread and fully visible.")
+
+    def validate(self, person_path: str) -> tuple[bool, str | None]:
+        bgr = cv2.imread(person_path)
+        if bgr is None:
+            return False, "This photo couldn't be read — please choose a different one."
+        if _hand_landmarks(bgr) is None:
+            return False, self._NO_HAND_MSG
+        return True, None
+
+    def run(self, person_path: str, accessory_path: str, output_path: str) -> None:
+        bgr = cv2.imread(person_path)
+        if bgr is None:
+            raise ValueError(f"Could not read person image: {person_path}")
+        hnd = _hand_landmarks(bgr)
+        if hnd is None:
+            raise LandmarkNotDetectedError(self._NO_HAND_MSG)
+        ph, pw = bgr.shape[:2]
+
+        mcp, pip = hnd["ring_mcp"], hnd["ring_pip"]
+        seg = pip - mcp
+        seg_len = np.hypot(*seg) or 1.0
+        axis = seg / seg_len
+        perp = np.array([-axis[1], axis[0]])
+        band_c = mcp + seg * self.BAND_POS_FRAC
+        band_w = seg_len * self.BAND_WIDTH_FRAC
+        dst_a = band_c - perp * (band_w / 2)      # map cutout left -> one edge
+        dst_b = band_c + perp * (band_w / 2)      # cutout right -> other edge
+
+        acc = np.array(Image.open(accessory_path).convert("RGBA"))
+        a_l, a_r, _ = _oc.silhouette_anchors(acc)
+        warped = _oc.similarity_from_2pt(a_l, a_r, dst_a, dst_b, acc, pw, ph)
+        warped = _oc.boost_alpha(warped)
+        _oc.composite(person_path, warped, output_path)
+        logger.info("Ring overlay: band at (%.0f, %.0f) w=%.0f -> %s",
+                    band_c[0], band_c[1], band_w, output_path)
+
+
+_earring_engine = _ring_engine = _hat_engine = _necklace_engine = None
+
+
+def get_earring_engine() -> EarringOverlayEngine:
+    global _earring_engine
+    if _earring_engine is None:
+        _earring_engine = EarringOverlayEngine()
+    return _earring_engine
+
+
+def get_ring_engine() -> RingOverlayEngine:
+    global _ring_engine
+    if _ring_engine is None:
+        _ring_engine = RingOverlayEngine()
+    return _ring_engine
+
+
+def get_hat_engine() -> HatOverlayEngine:
+    global _hat_engine
+    if _hat_engine is None:
+        _hat_engine = HatOverlayEngine()
+    return _hat_engine
+
+
+def get_necklace_engine() -> NecklaceOverlayEngine:
+    global _necklace_engine
+    if _necklace_engine is None:
+        _necklace_engine = NecklaceOverlayEngine()
+    return _necklace_engine
+
+
 # Registry keyed by accessory_type, the same string the API/task layer uses —
 # adding a new accessory engine is "implement it above + add a line here,"
 # not touching the route/task dispatch code (both already iterate this dict).
@@ -673,4 +982,8 @@ ACCESSORY_ENGINES = {
     "wrist": get_wrist_engine,
     "glasses": get_glasses_engine,
     "handbag": get_handbag_engine,
+    "earring": get_earring_engine,
+    "ring": get_ring_engine,
+    "hat": get_hat_engine,
+    "necklace": get_necklace_engine,
 }
